@@ -1,0 +1,11 @@
+# private data never leaves this Mac (review D4)
+logs/
+captures/
+*.capture.*
+# large local files
+models/
+.venv/
+m0_ane/out/
+__pycache__/
+.pytest_cache/
+.DS_Store
