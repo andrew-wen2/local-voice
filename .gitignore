@@ -12,3 +12,5 @@ __pycache__/
 tools/winlist
 tools/hotkey
 tools/parakeet/.build/
+eval/recall/sessions/*/html/
+eval/recall/sessions/*/png/
