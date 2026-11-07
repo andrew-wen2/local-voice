@@ -232,7 +232,8 @@ class GemmaAdapter:
         # M1 (ARCHITECTURE.md §3.3): don't build Gemma's audio encoder (0.61 GB; WhisperKit does speech).
         self.skip_audio = skip_audio
         # G1 (§4.2): during prefill, run the 18 KV-shared layers only for the last token. They store
-        # no cache, so the snapshot is bit-identical (checked 2026-11-06) and ~43% of layer work is skipped.
+        # no cache, so the snapshot is bit-identical (checked 2026-11-06). No speed gain in reads (S0): MLX is
+        # lazy and a read evaluates only the cache, so those layers never ran anyway. Kept as a guard.
         self.skip_shared = skip_shared
         # M2 (§3.4): read the 1.59 GB per-layer embedding table's rows from the model file on demand.
         self.stream_ple = stream_ple
