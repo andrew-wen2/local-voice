@@ -411,11 +411,14 @@ class GemmaAdapter:
         cache = yield from self.prefill_text_steps(clone_cache(prefix_cache), ids, layers_per_piece)
         return cache
 
-    def encode_steps(self, image, note: Optional[str] = None, inp=None):
+    def encode_steps(self, image, note: Optional[str] = None, inp=None, resume=None):
         """Image prep + vision encoder in pieces (patch embedding, 16 layers, pooling).
-        Returns (inputs of the screen turn without <bos>, image tokens). `inp`: already-prepared inputs."""
-        inp = inp if inp is not None else self._inputs(image, self.screen_turn_prompt(note))
-        yield None
+        Returns (inputs of the screen turn without <bos>, image tokens). `inp`: already-prepared inputs.
+        `resume`: (k, hidden [1, 768, 1, N]) after k vision layers on the Neural Engine; continue from
+        layer k instead of starting over (the encode moved to the GPU mid-way, §6.1)."""
+        if inp is None:
+            inp = self._inputs(image, self.screen_turn_prompt(note))
+            yield None
         vt = self.model.vision_tower
         pixel_values = inp["pixel_values"]
         B, C, H, W = pixel_values.shape
@@ -424,14 +427,20 @@ class GemmaAdapter:
         positions, padding_mask, _ = vt._patch_positions_single(H, W, max_patches=num_real)
         patch_positions = mx.array(np.tile(positions[None], (B, 1, 1)))
         padding_positions = mx.array(np.tile(padding_mask[None], (B, 1)))
-        h = vt.patch_embedder(pixel_values, patch_positions, padding_positions)
+        if resume is None:
+            start = 0
+            h = vt.patch_embedder(pixel_values, patch_positions, padding_positions)
+        else:
+            start, x = resume
+            h = mx.array(np.ascontiguousarray(np.asarray(x)[:, :, 0, :].transpose(0, 2, 1)))
+            h = h.astype(vt.patch_embedder.input_proj.weight.dtype)
         valid = ~padding_positions
         attn_mask = mx.expand_dims(valid, 1) * mx.expand_dims(valid, 2)
         attn_mask = mx.where(attn_mask, mx.array(0.0, dtype=h.dtype), mx.array(-1e4, dtype=h.dtype))
         attn_mask = mx.expand_dims(attn_mask, 1)
         mx.eval(h, attn_mask)
         yield None
-        for layer in vt.encoder.layers:
+        for layer in vt.encoder.layers[start:]:
             h = layer(h, patch_positions, attn_mask)
             mx.eval(h)
             yield None
@@ -446,19 +455,34 @@ class GemmaAdapter:
         yield None
         return inp, feats
 
-    def encode_steps_ane(self, image, ane, note: Optional[str] = None):
-        """encode_steps with the vision tower on the Neural Engine (ane_vision.AneVisionEncoder, §6.1).
-        Pieces: image prep, one per Core ML chunk (blocking calls, GPU idle), embed_vision on the GPU.
-        Falls back to encode_steps when no converted bucket matches the image's processed size.
-        Sets self.last_encode to 'ane' or 'gpu'."""
+    # -- Neural Engine encoder hand-off (ane_vision.py, ARCHITECTURE.md §6.1)
+    def prepare_screen(self, image, note: Optional[str] = None):
+        """Image prep for the screen turn (CPU). Returns (inputs, pixel values as numpy [1, 3, H, W])."""
         inp = self._inputs(image, self.screen_turn_prompt(note))
-        pv = inp["pixel_values"]
-        if ane is None or not ane.has(int(pv.shape[2]), int(pv.shape[3])):
+        return inp, np.asarray(inp["pixel_values"], dtype=np.float32)
+
+    def feats_from_tokens(self, inp, tokens: np.ndarray):
+        """Vision-tower output from the Neural Engine -> image features for the text model, on the GPU.
+        Returns the same (inputs, features) pair as encode_steps."""
+        vt = self.model.vision_tower
+        feats = mx.array(tokens).astype(vt.patch_embedder.input_proj.weight.dtype)
+        if vt.config.standardize:
+            feats = (feats - vt.std_bias) * vt.std_scale
+        feats = self.model.embed_vision(feats)
+        mx.eval(feats)
+        return inp, feats
+
+    def encode_steps_ane(self, image, ane, note: Optional[str] = None):
+        """encode_steps with the vision tower on the Neural Engine, run inline (blocking Core ML calls).
+        For checks and tools; the app goes through GpuWorker's AneRunner instead. Falls back to
+        encode_steps when no converted bucket matches. Sets self.last_encode to 'ane' or 'gpu'."""
+        inp, pv = self.prepare_screen(image, note)
+        yield None
+        if ane is None or not ane.has(pv.shape[2], pv.shape[3]):
             self.last_encode = "gpu"
             return (yield from self.encode_steps(image, note, inp=inp))
         self.last_encode = "ane"
-        yield None
-        g = ane.encode_steps(np.asarray(pv, dtype=np.float32))
+        g = ane.encode_steps(pv)
         while True:
             try:
                 next(g)
@@ -466,14 +490,9 @@ class GemmaAdapter:
                 tokens = e.value
                 break
             yield None
-        vt = self.model.vision_tower
-        feats = mx.array(tokens).astype(vt.patch_embedder.input_proj.weight.dtype)
-        if vt.config.standardize:
-            feats = (feats - vt.std_bias) * vt.std_scale
-        feats = self.model.embed_vision(feats)
-        mx.eval(feats)
+        enc = self.feats_from_tokens(inp, tokens)
         yield None
-        return inp, feats
+        return enc
 
     def screen_steps(self, prefix_cache, encoded, layers_per_piece: int = 2):
         """Append the screen turn to a copy of prefix_cache, or to a fresh cache starting with <bos>
@@ -689,6 +708,93 @@ class ReadJob:
     ex_mark: int = 0                  # exchanges completed when the job took its history
     note: Optional[str] = None        # open-windows line for the screen turn
     restarts: int = 0
+    ane: Optional["AneJob"] = field(repr=False, default=None)   # encode on the Neural Engine, if any
+    waiting: bool = False             # last step was a wait for the Neural Engine (no GPU work)
+    encoder: str = ""                 # "ane" | "gpu" once the image is encoded
+
+
+@dataclass
+class AneJob:
+    """One image for the Neural Engine encoder. Written by AneRunner, read by the GPU worker."""
+    pixel_values: np.ndarray = field(repr=False)
+    gen: Optional[Iterator] = field(repr=False, default=None)
+    tokens: Optional[np.ndarray] = field(repr=False, default=None)
+    chunks_done: int = 0
+    ane_s: float = 0.0
+    submitted: float = field(default_factory=time.perf_counter)
+    done: bool = False
+    cancelled: bool = False
+    error: Optional[BaseException] = None
+    partial: Optional[tuple] = field(repr=False, default=None)   # (vision layers done, hidden state)
+
+
+class AneRunner(threading.Thread):
+    """Runs the Core ML vision chunks (ane_vision.AneVisionEncoder) on the Neural Engine, one call at a
+    time, on its own thread because the calls block. A chunk starts only while quiet() holds, i.e. no
+    turn is active (ARCHITECTURE.md §6.1), so speech recognition never queues behind a new chunk.
+    Only the newest job runs; submitting cancels the previous one between chunks."""
+
+    def __init__(self, encoder, quiet: Callable[[], bool], on_done: Callable[[], None]):
+        super().__init__(daemon=True, name="ane-runner")
+        self.encoder, self.quiet, self.on_done = encoder, quiet, on_done
+        self.cv = threading.Condition()
+        self.job: Optional[AneJob] = None
+        self._stop = False
+        self.stats = {"chunks": 0, "ane_s": 0.0, "encodes": 0, "wasted_chunks": 0, "errors": 0}
+
+    def submit(self, job: AneJob):
+        with self.cv:
+            if self.job is not None and not self.job.done:
+                self.job.cancelled = True
+            self.job = job
+            self.cv.notify_all()
+
+    def poke(self):
+        with self.cv:
+            self.cv.notify_all()
+
+    def stop(self):
+        with self.cv:
+            self._stop = True
+            self.cv.notify_all()
+
+    def _runnable(self) -> bool:
+        j = self.job
+        return j is not None and not j.done and not j.cancelled and self.quiet()
+
+    def run(self):
+        while True:
+            with self.cv:
+                while not self._stop and not self._runnable():
+                    self.cv.wait(0.05)
+                if self._stop:
+                    return
+                job = self.job
+            if job.gen is None:
+                job.gen = self.encoder.encode_steps(job.pixel_values)
+            t0 = time.perf_counter()
+            try:
+                y = next(job.gen)                   # one Core ML call (one chunk)
+                if isinstance(y, tuple) and len(y) >= 4:
+                    job.partial = (y[2], y[3])
+            except StopIteration as e:
+                job.tokens = e.value
+                job.done = True
+            except Exception as e:                  # surface to the worker; it falls back to the GPU
+                job.error = e
+                job.done = True
+                self.stats["errors"] += 1
+            dt = time.perf_counter() - t0
+            job.chunks_done += 1
+            job.ane_s += dt
+            self.stats["chunks"] += 1
+            self.stats["ane_s"] = round(self.stats["ane_s"] + dt, 3)
+            if job.cancelled:
+                self.stats["wasted_chunks"] += 1        # finished after its job was dropped
+            if job.done:
+                if job.error is None:
+                    self.stats["encodes"] += 1
+                self.on_done()
 
 
 def _whole_read(adapter, image, frame_id, captured_at):
@@ -700,6 +806,7 @@ def _whole_read(adapter, image, frame_id, captured_at):
 
 POLICIES = ("p0", "p1", "p2")
 FRESHNESS = ("A", "B", "C")
+PLACEMENTS = ("gpu", "split")
 
 
 class GpuWorker(threading.Thread):
@@ -718,16 +825,26 @@ class GpuWorker(threading.Thread):
     Latest frame wins: in p1/p2 a newer frame drops a partial read, unless an answer waits for it.
     Load caps: a new read starts at most once per min_read_interval_s, and reads use at most
     duty_cap of GPU time over the last 60 s. A read an answer is waiting for ignores both caps.
+
+    Placement (ARCHITECTURE.md §6.1):
+      gpu    every image is encoded on the GPU (MLX)
+      split  P4: a read started in quiet time (no turn active, not urgent) encodes its image on the
+             Neural Engine (AneRunner); the GPU stays free meanwhile. If a turn starts or an answer
+             needs that frame, the encode moves to the GPU. Text prefill always runs on the GPU.
     """
 
     def __init__(self, adapter: GemmaAdapter, tts: Tts, budget: int = 1120, warm_image=None,
                  first_chunk: str = "phrase", trim_silence: bool = True, mlx_cache_gb: float = 0.0,
                  policy: str = "p2", freshness: str = "B", fresh_ms: float = 300.0,
                  layers_per_piece: int = 2, min_read_interval_s: float = 0.0, duty_cap: float = 1.0,
-                 history: bool = True, history_max_tokens: int = 2000, since_max_tokens: int = 1500):
+                 history: bool = True, history_max_tokens: int = 2000, since_max_tokens: int = 1500,
+                 placement: str = "gpu", ane_root: Optional[str] = None, ane_encoder=None):
         super().__init__(daemon=True, name="gpu-worker")
         self.adapter, self.tts, self.budget, self.warm_image = adapter, tts, budget, warm_image
         assert first_chunk in ("phrase", "sentence") and policy in POLICIES and freshness in FRESHNESS
+        assert placement in PLACEMENTS and not (placement == "split" and policy == "p0"), (placement, policy)
+        self.placement, self.ane_root, self.ane = placement, ane_root, ane_encoder
+        self.ane_runner: Optional[AneRunner] = None
         self.first_chunk, self.trim, self.mlx_cache_gb = first_chunk, trim_silence, mlx_cache_gb
         self.policy, self.freshness, self.fresh_ms = policy, freshness, fresh_ms
         self.layers_per_piece = layers_per_piece
@@ -742,7 +859,8 @@ class GpuWorker(threading.Thread):
         self.cancel = threading.Event()
         self.ready = threading.Event()
         self.startup: dict = {}
-        self.stats = {"reads": 0, "frames_dropped": 0, "reads_dropped": 0, "answers_after_pause": 0}
+        self.stats = {"reads": 0, "frames_dropped": 0, "reads_dropped": 0, "answers_after_pause": 0,
+                      "ane_reads": 0, "ane_to_gpu": 0}
         self.read_log: list[dict] = []
         self.error: Optional[BaseException] = None
         self._stop = False
@@ -779,6 +897,8 @@ class GpuWorker(threading.Thread):
         with self.cv:
             self.turn_active = active
             self.cv.notify_all()
+        if self.ane_runner is not None:
+            self.ane_runner.poke()
 
     def submit_answer(self, job: AnswerJob) -> AnswerJob:
         with self.cv:
@@ -799,6 +919,11 @@ class GpuWorker(threading.Thread):
         with self.cv:
             self._stop = True
             self.cv.notify_all()
+        if self.ane_runner is not None:
+            self.ane_runner.stop()
+            self.ane_runner.join(timeout=2)
+        if hasattr(self.ane, "close"):
+            self.ane.close()
 
     def first_snapshot_wait(self, timeout: float) -> bool:
         t = time.time() + timeout
@@ -884,9 +1009,11 @@ class GpuWorker(threading.Thread):
             return ("piece", False)
         if self.read is not None:
             if self.pending_frame is not None and not self.read.pinned and self.read.kind in ("read", "reanchor"):   # latest frame wins
-                self.read.gen.close()
+                self.read.gen.close()                   # also cancels its Neural Engine encode
                 self.read = None
                 self.stats["reads_dropped"] += 1
+            elif self._waiting_on_ane(self.read):
+                return None                             # no GPU work: AneRunner notifies when done
             else:
                 return ("piece", False)
         if self.pending_frame is not None and self._may_start_read():
@@ -897,6 +1024,58 @@ class GpuWorker(threading.Thread):
             self._start_read(reanchor=True)             # move a long tail of turns into the older history
             return ("piece", False)
         return None
+
+    def _waiting_on_ane(self, rj) -> bool:
+        j = rj.ane
+        return (rj.waiting and j is not None and not j.done and not j.cancelled
+                and not rj.pinned and not self.turn_active)
+
+    def _ane_quiet(self) -> bool:
+        return not self.turn_active and not self.answer_q
+
+    def _ane_done(self):
+        with self.cv:
+            self.cv.notify_all()
+
+    def _encode_gen(self, rj):
+        """Encode rj.image for the screen turn: on the Neural Engine when placement is split, the read
+        is not urgent, no turn is active and a converted bucket matches; else on the GPU. Yields None
+        after GPU work and "ane_wait" while the Neural Engine runs. Returns (inputs, image features)."""
+        a = self.adapter
+        inp, pv = a.prepare_screen(rj.image, rj.note)
+        yield None                                      # image prep (CPU, on this thread)
+        if (self.ane_runner is not None and not rj.pinned and not self.turn_active
+                and self.ane.has(pv.shape[2], pv.shape[3])):
+            job = rj.ane = AneJob(pv)
+            self.ane_runner.submit(job)
+            try:
+                while not job.done and not (rj.pinned or self.turn_active):
+                    yield "ane_wait"
+            finally:
+                if not job.done:
+                    job.cancelled = True                # dropped, or moved to the GPU
+            if job.done and job.error is None:
+                rj.encoder = "ane"
+                self.stats["ane_reads"] += 1
+                enc = a.feats_from_tokens(inp, job.tokens)
+                yield None
+                return enc
+            self.stats["ane_to_gpu"] += 1               # urgent now (or failed): the GPU is faster
+            resume = job.partial if job.error is None else None
+            if resume is not None:                      # continue after the layers the Neural Engine did
+                rj.encoder = f"ane{resume[0]}+gpu"
+                self.stats["ane_layers_reused"] = self.stats.get("ane_layers_reused", 0) + resume[0]
+                return (yield from a.encode_steps(rj.image, rj.note, inp=inp, resume=resume))
+        rj.encoder = "gpu"
+        return (yield from a.encode_steps(rj.image, rj.note, inp=inp))
+
+    def _plain_read(self, rj):
+        """A read without history through the encode + screen-turn pieces (split placement).
+        With no prefix the context is the single-turn prompt, as read_screen_steps builds."""
+        rj.encoded = yield from self._encode_gen(rj)
+        cache, n = yield from self.adapter.screen_steps(None, rj.encoded, self.layers_per_piece)
+        return Snapshot(rj.frame_id, rj.captured_at, time.time(), time.time(), getattr(self.adapter, "budget", None),
+                        n, master=cache)
 
     def _newest_unread(self) -> int:
         ids = [f for f in ((self.pending_frame or (None,))[0],
@@ -947,6 +1126,10 @@ class GpuWorker(threading.Thread):
                          note=None if reanchor else getattr(self, "pending_note", None))
             rj.gen = self._context_read(rj)
             rj.total = self._read_total(rj)
+        elif self.ane_runner is not None:
+            rj = ReadJob(fid, cap, started=time.perf_counter(), pinned=urgent, image=image)
+            rj.gen = self._plain_read(rj)
+            rj.total = self._read_total(rj)
         else:
             steps = getattr(self.adapter, "read_screen_steps", None)
             gen = (steps(image, frame_id=fid, captured_at=cap, layers_per_piece=self.layers_per_piece)
@@ -980,7 +1163,9 @@ class GpuWorker(threading.Thread):
         """A screen read with history: encode the image, extend the older history with the exchanges
         finished since the last screen, then append the screen turn. Generator; returns a commit tuple."""
         a = self.adapter
-        if rj.encoded is None:
+        if rj.encoded is None and self.ane_runner is not None:
+            rj.encoded = yield from self._encode_gen(rj)
+        elif rj.encoded is None:
             rj.encoded = (yield from a.encode_steps(rj.image, note=rj.note)) if rj.note \
                 else (yield from a.encode_steps(rj.image))
         with self.cv:
@@ -1013,6 +1198,10 @@ class GpuWorker(threading.Thread):
             t0 = time.perf_counter()
             try:
                 y = next(rj.gen)
+                if y == "ane_wait":                   # the Neural Engine is encoding: nothing ran here
+                    rj.waiting = True
+                    return
+                rj.waiting = False
                 if isinstance(y, tuple):
                     rj.done, rj.total = y
                 else:
@@ -1040,7 +1229,9 @@ class GpuWorker(threading.Thread):
                 self.stats["reads"] += 1
                 self.read_log.append({"frame_id": rj.frame_id, "captured_at": rj.captured_at,
                                       "read_s": round(rj.gpu_s, 3), "wall_s": round(t1 - rj.started, 3),
-                                      "pieces": rj.total, "pauses": rj.pauses, "prefix_len": snap.prefix_len})
+                                      "pieces": rj.total, "pauses": rj.pauses, "prefix_len": snap.prefix_len,
+                                      "encoder": rj.encoder or "gpu",
+                                      "ane_s": round(rj.ane.ane_s, 3) if rj.ane is not None else 0.0})
                 self.cv.notify_all()
             return
 
@@ -1071,7 +1262,9 @@ class GpuWorker(threading.Thread):
                 self.read_log.append({"frame_id": rj.frame_id, "captured_at": rj.captured_at, "kind": rj.kind,
                                       "read_s": round(rj.gpu_s, 3), "wall_s": round(time.perf_counter() - rj.started, 3),
                                       "pieces": rj.done, "pauses": rj.pauses, "restarts": rj.restarts,
-                                      "prefix_len": snap.prefix_len, "history_exchanges": len(target)})
+                                      "prefix_len": snap.prefix_len, "history_exchanges": len(target),
+                                      "encoder": rj.encoder or ("reused" if rj.kind == "reanchor" else "gpu"),
+                                      "ane_s": round(rj.ane.ane_s, 3) if rj.ane is not None else 0.0})
             self.cv.notify_all()
 
     def _startup(self):
@@ -1088,6 +1281,15 @@ class GpuWorker(threading.Thread):
         for _ in self.tts.synth("Ready."):
             pass
         self.startup["kokoro_load_warm_s"] = round(time.perf_counter() - t0, 2)
+        if self.placement == "split":
+            t0 = time.perf_counter()
+            if self.ane is None:                        # a child process: Core ML holds the GIL per call
+                from ane_vision import OUT, AneProcess
+                self.ane = AneProcess(Path(self.ane_root) if self.ane_root else OUT).load()
+            self.startup["ane_load_s"] = round(time.perf_counter() - t0, 2)
+            self.startup["ane_buckets"] = [f"{h}x{w}" for h, w in getattr(self.ane, "buckets", {})]
+            self.ane_runner = AneRunner(self.ane, quiet=self._ane_quiet, on_done=self._ane_done)
+            self.ane_runner.start()
         if self.warm_image is not None:   # compile kernels for this budget: one read + a short answer
             t0 = time.perf_counter()
             steps = getattr(self.adapter, "read_screen_steps", None)

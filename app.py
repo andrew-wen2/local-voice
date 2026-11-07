@@ -33,7 +33,7 @@ from typing import Optional  # noqa: E402
 import numpy as np  # noqa: E402
 
 import screen as scr  # noqa: E402
-from asr import AsrError, WhisperServer  # noqa: E402
+from asr import AsrError, make_asr  # noqa: E402
 from audio_io import Mic, Speaker, near_silent, rms_dbfs  # noqa: E402
 from engine import AnswerJob, GemmaAdapter, GpuWorker, Tts  # noqa: E402
 
@@ -65,7 +65,7 @@ def footprint_bytes(pid: int) -> Optional[int]:
 
 
 class Monitor(threading.Thread):
-    """Once a second: combined memory of this app + WhisperKit (D19), and macmon power/fan if available."""
+    """Once a second: combined memory of this app + the speech recognition process (D19), and macmon power/fan if available."""
 
     def __init__(self, pids_fn):
         super().__init__(daemon=True, name="monitor")
@@ -108,7 +108,7 @@ class Monitor(threading.Thread):
             return {}
         gb = lambda b: round(b / 1e9, 2)
         out = {"mem_peak_gb": gb(max(x["mem_total"] for x in s))}
-        for k in ("mem_app", "mem_asr"):
+        for k in ("mem_app", "mem_asr", "mem_ane"):
             v = [x[k] for x in s if x.get(k)]
             if v:
                 out[f"{k}_peak_gb"] = gb(max(v))
@@ -129,16 +129,18 @@ class Monitor(threading.Thread):
 # ---------------------------------------------------------------- the assistant
 
 class Assistant:
-    def __init__(self, budget: int = 1120, sandbox_profile: Optional[Path] = None, **worker_opts):
+    def __init__(self, budget: int = 1120, sandbox_profile: Optional[Path] = None, asr: str = "parakeet",
+                 **worker_opts):
         """worker_opts go to GpuWorker: first_chunk, trim_silence, mlx_cache_gb, policy, freshness,
         fresh_ms, layers_per_piece, min_read_interval_s, duty_cap."""
         self.budget = budget
         self.worker_opts = worker_opts
         LOGS.mkdir(exist_ok=True)
-        self.asr = WhisperServer(log_path=LOGS / "whisperkit.log")
+        self.asr_kind = asr
+        self.asr = make_asr(asr, log_dir=LOGS)
         self.sandbox_profile = sandbox_profile
         self.worker: Optional[GpuWorker] = None
-        self.monitor = Monitor(lambda: {"app": os.getpid(), "asr": self.asr.pid()})
+        self.monitor = Monitor(lambda: {"app": os.getpid(), "asr": self.asr.pid(), "ane": self._ane_pid()})
         self.startup: dict = {}
         self.ready = False
 
@@ -146,10 +148,11 @@ class Assistant:
         """Readiness gate (D8): ASR healthy + warm, models loaded + warm, first screen read done."""
         t_all = time.perf_counter()
         self.monitor.start()
-        self.startup["whisper_start_s"] = round(self.asr.start(sandbox_profile=self.sandbox_profile), 2)
+        self.startup["asr"] = self.asr_kind
+        self.startup["asr_start_s"] = round(self.asr.start(sandbox_profile=self.sandbox_profile), 2)
         t0 = time.perf_counter()
         self.asr.transcribe((QDIR / "v01.wav").read_bytes())
-        self.startup["whisper_warm_s"] = round(time.perf_counter() - t0, 2)
+        self.startup["asr_warm_s"] = round(time.perf_counter() - t0, 2)
         self.worker = GpuWorker(GemmaAdapter(), Tts(), budget=self.budget, warm_image=warm_image,
                                 **self.worker_opts)
         self.worker.start()
@@ -166,6 +169,11 @@ class Assistant:
         self.startup["total_s"] = round(time.perf_counter() - t_all, 2)
         self.ready = True
 
+    def _ane_pid(self):
+        """The Neural Engine encoder's child process (placement split), counted in the memory budget."""
+        ane = getattr(self.worker, "ane", None)
+        return ane.pid() if hasattr(ane, "pid") else None
+
     def stop(self):
         if self.worker:
             self.worker.stop()
@@ -180,6 +188,9 @@ class Assistant:
         if not isinstance(audio, (bytes, bytearray)):
             row["near_silent"] = near_silent(audio)
             row["input_dbfs"] = round(rms_dbfs(audio), 1)
+            if row["near_silent"]:          # Parakeet turns a padded near-silent tap into "Okay." / "Uh"
+                mark("turn_complete")
+                return {**row, "transcript": "", "error": "empty transcript (mic muted or no permission?)"}
         try:
             tr = self.asr.transcribe(audio)
         except AsrError as e:
@@ -214,7 +225,7 @@ def live(args):
               "then restart the terminal. (Without it, macOS returns only the wallpaper.)")
         sys.exit(2)
     cap = scr.Capturer(fmt="jpg")
-    asst = Assistant(budget=args.budget, **worker_opts(args))
+    asst = Assistant(budget=args.budget, asr=args.asr, **worker_opts(args))
     speaker = Speaker().start()
     mic = Mic().start()
     print("starting (first launch can take a few minutes)...", flush=True)
@@ -483,7 +494,7 @@ def replay(args):
     else:
         cases = sets[args.replay]
     asst = Assistant(budget=args.budget, sandbox_profile=Path(args.sandbox_profile) if args.sandbox_profile else None,
-                     **worker_opts(args))
+                     asr=args.asr, **worker_opts(args))
     first = cases[0].get("before") or cases[0].get("screen")
     asst.start(warm_image=screens[first], first_frame=(1, time.time(), screens[first]))
     rows: list = []
@@ -515,14 +526,17 @@ def replay(args):
                                                      "fresh_decision", "read_paused", "answer")}),
                   flush=True)
     asst.stop()
-    out = LOGS / f"replay-{args.replay}-{args.budget}-{getattr(args, 'policy', 'p2')}{getattr(args, 'freshness', 'B')}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    out = LOGS / f"replay-{args.replay}-{args.budget}-{args.asr}-{getattr(args, 'policy', 'p2')}{getattr(args, 'freshness', 'B')}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     with out.open("w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
     summary = summarize(results)
-    summary.update(set=args.replay, budget=args.budget, policy=getattr(args, "policy", "p2"),
+    summary.update(set=args.replay, budget=args.budget, asr=args.asr, policy=getattr(args, "policy", "p2"),
                    freshness=getattr(args, "freshness", "B"), startup=asst.startup, log=str(out),
                    reads_dropped=asst.worker.stats.get("reads_dropped"))
+    runner = asst.worker.ane_runner
+    summary.update(placement=getattr(args, "placement", "gpu"), ane_reads=asst.worker.stats.get("ane_reads"),
+                   ane_to_gpu=asst.worker.stats.get("ane_to_gpu"), ane=runner.stats if runner else None)
     print("SUMMARY", json.dumps(summary))
     return summary
 
@@ -560,6 +574,11 @@ def add_worker_args(ap):
     ap.add_argument("--layers-per-piece", type=int, default=2, help="text layers per read piece")
     ap.add_argument("--min-read-interval", type=float, default=0.0, help="rate cap: seconds between read starts (0 = off)")
     ap.add_argument("--duty-cap", type=float, default=1.0, help="reads may use at most this share of GPU time per minute (1 = off)")
+    ap.add_argument("--placement", choices=["gpu", "split"], default="gpu",
+                    help="image encoder: gpu (default) or split = P4, quiet-time encodes on the Neural Engine (ane_vision.py)")
+    ap.add_argument("--ane-root", default=None, help="folder of converted Core ML encoders (default models/vision-coreml)")
+    ap.add_argument("--asr", choices=["parakeet", "whisper"], default="parakeet",
+                    help="speech recognition: Parakeet TDT 0.6B v2 (default, ~40 ms) or WhisperKit large-v3 turbo (~470 ms)")
     ap.add_argument("--show-text", action="store_true",
                     help="print the transcript and answer in the terminal (the assistant can then read them on screen)")
     ap.add_argument("--hotkey", choices=["right_option", "right_command", "right_control", "fn", "none"],
@@ -574,7 +593,7 @@ def worker_opts(args) -> dict:
                 mlx_cache_gb=None if g("mlx_cache_gb", 0.0) < 0 else g("mlx_cache_gb", 0.0),
                 policy=g("policy", "p2"), freshness=g("freshness", "B"), fresh_ms=g("fresh_ms", 300.0),
                 layers_per_piece=g("layers_per_piece", 2), min_read_interval_s=g("min_read_interval", 0.0),
-                duty_cap=g("duty_cap", 1.0),
+                duty_cap=g("duty_cap", 1.0), placement=g("placement", "gpu"), ane_root=g("ane_root", None),
                 history={"on": True, "off": False}.get(g("history", "auto"), not g("replay", None)))
 
 

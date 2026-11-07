@@ -52,6 +52,14 @@ def test_near_silent_turn_is_flagged():
     assert "turn_complete" in marks
 
 
+def test_near_silent_turn_skips_recognition():
+    """Parakeet turns a padded near-silent tap into "Okay."; such a turn must not reach the model."""
+    a = app.Assistant.__new__(app.Assistant)
+    a.ready, a.asr = True, FakeAsr("Okay.")
+    row = a.answer_turn(np.zeros(8000, np.float32), lambda *x: None, lambda n: None, 0.0, 0.0)
+    assert row["transcript"] == "" and "empty transcript" in row["error"]
+
+
 def test_live_exits_with_message_without_screen_permission(monkeypatch, capsys):
     monkeypatch.setattr(app.scr, "has_screen_permission", lambda: False)
     with pytest.raises(SystemExit) as e:

@@ -11,3 +11,4 @@ __pycache__/
 .DS_Store
 tools/winlist
 tools/hotkey
+tools/parakeet/.build/
