@@ -30,6 +30,13 @@ from typing import Callable, Iterator, Optional
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+# M3: keep torch out of the app process. transformers (Gemma's processor) and spaCy's thinc (Kokoro's
+# phonemizer) both treat it as optional; a None entry makes `import torch` fail and find_spec return
+# None. torch stays installed for the Core ML conversion (m0_ane/vision_coreml.py). LV_ALLOW_TORCH=1 undoes it.
+if os.environ.get("LV_ALLOW_TORCH") != "1":
+    import sys
+    sys.modules.setdefault("torch", None)
+
 import mlx.core as mx  # noqa: E402
 import numpy as np  # noqa: E402
 
