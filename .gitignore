@@ -9,3 +9,5 @@ m0_ane/out/
 __pycache__/
 .pytest_cache/
 .DS_Store
+tools/winlist
+tools/hotkey

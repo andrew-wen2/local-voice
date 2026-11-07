@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """app.py — offline, screen-aware voice assistant (MVP, naive baseline).
 
-  python app.py                      live: Enter = start talking, Enter = stop, Enter while it speaks = interrupt, q = quit
+  python app.py                      live: hold Right Option in any app to talk (release = stop, press while it speaks = interrupt);
+                                     Enter in the terminal also works (talk / stop / interrupt), q = quit
   python app.py --replay reading     replay a test set through the timing harness (reading|reasoning|voice|contention)
   python app.py --replay voice --sandbox-profile eval/offline.sb   (used by the offline test)
 
@@ -128,10 +129,11 @@ class Monitor(threading.Thread):
 # ---------------------------------------------------------------- the assistant
 
 class Assistant:
-    def __init__(self, budget: int = 1120, sandbox_profile: Optional[Path] = None, first_chunk: str = "phrase",
-                 trim_silence: bool = True, mlx_cache_gb: Optional[float] = 0.0):
+    def __init__(self, budget: int = 1120, sandbox_profile: Optional[Path] = None, **worker_opts):
+        """worker_opts go to GpuWorker: first_chunk, trim_silence, mlx_cache_gb, policy, freshness,
+        fresh_ms, layers_per_piece, min_read_interval_s, duty_cap."""
         self.budget = budget
-        self.worker_opts = dict(first_chunk=first_chunk, trim_silence=trim_silence, mlx_cache_gb=mlx_cache_gb)
+        self.worker_opts = worker_opts
         LOGS.mkdir(exist_ok=True)
         self.asr = WhisperServer(log_path=LOGS / "whisperkit.log")
         self.sandbox_profile = sandbox_profile
@@ -192,7 +194,9 @@ class Assistant:
         job.done.wait(120)
         r = job.result
         row.update({k: r.get(k) for k in ("answer", "stop", "cap_hit", "cancelled", "sentences_spoken", "chunks_spoken", "first_chunk_text", "first_chunk_mode", "frame_id",
-                                          "budget", "read_in_flight_at_submit", "question_tokens", "error")})
+                                          "budget", "read_in_flight_at_submit", "question_tokens", "error",
+                                          "policy", "fresh_decision", "read_paused", "stale_vs_submit",
+                                          "context_tokens", "history_exchanges")})
         row["wait_behind_read_ms"] = round(r.get("wait_behind_read_s", 0) * 1000, 1)
         row["restore_ms"] = round(r.get("restore_s", 0) * 1000, 2)
         if r.get("screen_captured_at"):
@@ -216,70 +220,132 @@ def live(args):
     print("starting (first launch can take a few minutes)...", flush=True)
     first = cap.grab()
     asst.start(warm_image=first, first_frame=(0, time.time(), first))
-    watcher = scr.ScreenWatcher(on_frame=asst.worker.submit_frame, grab=cap.grab)
+    watcher = scr.ScreenWatcher(on_frame=asst.worker.submit_frame, grab=cap.grab, describe=scr.window_summary)
     watcher.last_sent = np.asarray(first)
+    watcher.last_sent_small = scr.shrink(first)
     watcher.start()
     log = LOGS / f"turns-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
-    print(f"ready in {asst.startup['total_s']} s  {asst.startup}\nEnter = talk, Enter = stop, Enter while speaking = interrupt, q = quit")
+    import queue
+    events: "queue.Queue[str]" = queue.Queue()
+
+    def read_stdin():
+        for line in sys.stdin:
+            events.put("quit" if line.strip().lower() == "q" else "enter")
+        events.put("quit")
+    threading.Thread(target=read_stdin, daemon=True).start()
+
+    hotkey_proc, hotkey_msg = None, "off"
+    hk = getattr(args, "hotkey", "right_option")
+    if hk != "none" and (ROOT / "tools/hotkey").exists():
+        hotkey_proc = subprocess.Popen([str(ROOT / "tools/hotkey"), hk], stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True)
+        first_line = hotkey_proc.stdout.readline().strip()
+        if first_line.startswith("ready"):
+            hotkey_msg = f"hold {hk.replace('_', ' ')} anywhere = talk (release = stop, press while speaking = interrupt)"
+
+            def read_hotkey():
+                for line in hotkey_proc.stdout:
+                    events.put(line.strip())
+            threading.Thread(target=read_hotkey, daemon=True).start()
+        else:
+            hotkey_msg = f"global hotkey unavailable: {first_line or 'no output'}"
+            hotkey_proc = None
+    print(f"ready in {asst.startup['total_s']} s  {asst.startup}\n"
+          f"Enter = talk / stop / interrupt, q = quit;  {hotkey_msg}", flush=True)
+
     state = "idle"
     turn: dict = {}
+
+    def start_recording(source):
+        asst.worker.set_turn_active(True)
+        turn["apps_at_press"] = scr.front_apps()
+        watcher.capture_now()                          # talk key: read the current screen during the question
+        mic.begin()
+        turn["source"], turn["t_press"] = source, time.perf_counter()
+        print("listening..." + (" (release to stop)" if source == "hotkey" else " (Enter to stop)"), flush=True)
+
+    def interrupt():
+        t_int = asst.worker.interrupt()
+        dropped = speaker.clear()
+        print(f"  interrupted ({dropped / speaker.sr:.1f} s of audio dropped)", flush=True)
+        turn["thread"].join(10)
+        print(f"  GPU free {round((time.perf_counter() - t_int) * 1000)} ms after interrupt", flush=True)
+
+    def stop_and_answer():
+        audio = mic.end()
+        t_eos, t_eos_wall = time.perf_counter(), time.time()
+        marks: dict = {}
+        first_audio: dict = {}
+
+        def emit(samples, sr):
+            if "t" not in first_audio:
+                from harness.harness import first_audible
+                i = first_audible(samples)
+                if i is not None:
+                    first_audio["t"] = time.perf_counter() + i / sr
+            speaker.play(samples, sr)
+
+        apps_at_eos = scr.front_apps()
+        last_handed = dict(watcher.handed[-1]) if watcher.handed else {}
+
+        def run():
+            row = asst.answer_turn(audio, emit, lambda n: marks.setdefault(n, time.perf_counter()), t_eos_wall, t_eos)
+            used = next((h for h in reversed(watcher.handed) if h["frame_id"] == row.get("frame_id")), {})
+            row.update(apps_at_press=turn.get("apps_at_press"), apps_at_eos=apps_at_eos, talk_source=turn.get("source"),
+                       answered_frame={k: used.get(k) for k in ("frame_id", "reason", "apps", "waited_s")},
+                       answered_frame_age_s=round(t_eos_wall - used["captured_at"], 2) if used else None,
+                       newest_frame_at_eos={k: last_handed.get(k) for k in ("frame_id", "reason", "apps")},
+                       frames_sent_total=len(watcher.handed), displays=scr.active_displays())
+            speaker.wait_done(60)
+            asst.worker.set_turn_active(False)
+            ms = {k: round((v - t_eos) * 1000, 1) for k, v in marks.items()}
+            row.update(mode="live", t_eos_wall=t_eos_wall, marks_ms=ms,
+                       first_audio_ms=round((first_audio["t"] - t_eos) * 1000, 1) if "t" in first_audio else None,
+                       output_device_latency_ms=speaker.device_latency_ms(),
+                       capture=dict(cap.stats), **asst.monitor.window(t_eos_wall - 5, time.time()))
+            if row.get("near_silent"):
+                print("  (recording was nearly silent: mic muted or no Microphone permission?)")
+            # Don't print the words: the assistant sees this terminal and would read its own answers
+            # back as "terminal output" (live session 2026-11-06). Full text is in the log file.
+            if getattr(args, "show_text", False):
+                print(f"  you: {row.get('transcript')!r}\n  it:  {row.get('answer') or row.get('error')!r}", flush=True)
+            status = "error: " + row["error"] if row.get("error") else "answered"
+            print(f"  {status}, first audio {row['first_audio_ms']} ms after you stopped", flush=True)
+            with log.open("a") as f:
+                f.write(json.dumps(row) + "\n")
+            turn["state"] = "idle"
+
+        turn["state"] = "answering"
+        turn["thread"] = threading.Thread(target=run, daemon=True)
+        turn["thread"].start()
+
     while True:
-        line = sys.stdin.readline()
-        if not line or line.strip().lower() == "q":
+        ev = events.get()
+        if ev == "quit":
             break
-        if state == "idle":
-            asst.worker.set_turn_active(True)
-            mic.begin()
-            state = "recording"
-            print("listening... (Enter to stop)", flush=True)
-        elif state == "recording":
-            audio = mic.end()
-            t_eos, t_eos_wall = time.perf_counter(), time.time()
-            marks: dict = {}
-            first_audio: dict = {}
-
-            def emit(samples, sr):
-                if "t" not in first_audio:
-                    from harness.harness import first_audible
-                    i = first_audible(samples)
-                    if i is not None:
-                        first_audio["t"] = time.perf_counter() + i / sr
-                speaker.play(samples, sr)
-
-            def run():
-                row = asst.answer_turn(audio, emit, lambda n: marks.setdefault(n, time.perf_counter()), t_eos_wall, t_eos)
-                speaker.wait_done(60)
-                asst.worker.set_turn_active(False)
-                ms = {k: round((v - t_eos) * 1000, 1) for k, v in marks.items()}
-                row.update(mode="live", t_eos_wall=t_eos_wall, marks_ms=ms,
-                           first_audio_ms=round((first_audio["t"] - t_eos) * 1000, 1) if "t" in first_audio else None,
-                           output_device_latency_ms=speaker.device_latency_ms(),
-                           capture=dict(cap.stats), **asst.monitor.window(t_eos_wall - 5, time.time()))
-                if row.get("near_silent"):
-                    print("  (recording was nearly silent: mic muted or no Microphone permission?)")
-                print(f"  you: {row.get('transcript')!r}\n  it:  {row.get('answer') or row.get('error')!r}\n"
-                      f"  first audio {row['first_audio_ms']} ms after you stopped", flush=True)
-                with log.open("a") as f:
-                    f.write(json.dumps(row) + "\n")
-                turn["state"] = "idle"
-
-            turn["state"] = "answering"
-            turn["thread"] = threading.Thread(target=run, daemon=True)
-            turn["thread"].start()
-            state = "answering"
-        elif state == "answering":
-            if turn.get("state") == "answering":
-                t_int = asst.worker.interrupt()
-                dropped = speaker.clear()
-                print(f"  interrupted ({dropped / speaker.sr:.1f} s of audio dropped)", flush=True)
-                turn["thread"].join(10)
-                print(f"  GPU free {round((time.perf_counter() - t_int) * 1000)} ms after interrupt", flush=True)
+        if state == "answering" and turn.get("state") == "idle":
             state = "idle"
-            if turn.get("state") == "idle":
-                asst.worker.set_turn_active(True)
-                mic.begin()
-                state = "recording"
-                print("listening... (Enter to stop)", flush=True)
+        if ev in ("enter", "down"):
+            if state == "recording":
+                if ev == "enter":                           # Enter toggles: stop and answer
+                    stop_and_answer()
+                    state = "answering"
+                continue
+            if state == "answering":                        # barge in: stop the answer, then listen
+                interrupt()
+            start_recording("hotkey" if ev == "down" else "enter")
+            state = "recording"
+        elif ev == "up" and state == "recording" and turn.get("source") == "hotkey":
+            if time.perf_counter() - turn["t_press"] < 0.25:  # a tap, not a question: discard
+                mic.end()
+                asst.worker.set_turn_active(False)
+                state = "idle"
+                print("  (too short, ignored)", flush=True)
+                continue
+            stop_and_answer()
+            state = "answering"
+    if hotkey_proc:
+        hotkey_proc.terminate()
     watcher.stop()
     asst.stop()
     speaker.stop()
@@ -445,15 +511,18 @@ def replay(args):
                    "script_correct": ok, **row, **asst.monitor.window(t_wall0, time.time())}
             results.append(res)
             print(json.dumps({k: res.get(k) for k in ("case", "latency_ms", "script_correct", "stale",
-                                                     "wait_behind_read_ms", "read_in_flight_at_submit", "answer")}),
+                                                     "wait_behind_read_ms", "read_in_flight_at_submit",
+                                                     "fresh_decision", "read_paused", "answer")}),
                   flush=True)
     asst.stop()
-    out = LOGS / f"replay-{args.replay}-{args.budget}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    out = LOGS / f"replay-{args.replay}-{args.budget}-{getattr(args, 'policy', 'p2')}{getattr(args, 'freshness', 'B')}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     with out.open("w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
     summary = summarize(results)
-    summary.update(set=args.replay, budget=args.budget, startup=asst.startup, log=str(out))
+    summary.update(set=args.replay, budget=args.budget, policy=getattr(args, "policy", "p2"),
+                   freshness=getattr(args, "freshness", "B"), startup=asst.startup, log=str(out),
+                   reads_dropped=asst.worker.stats.get("reads_dropped"))
     print("SUMMARY", json.dumps(summary))
     return summary
 
@@ -468,6 +537,9 @@ def summarize(results: list) -> dict:
         "script_correct": f"{sum(r['script_correct'] for r in scored)}/{len(scored)}" if scored else None,
         "stale": sum(1 for r in results if r.get("stale")),
         "waited_behind_read": sum(1 for r in results if r.get("read_in_flight_at_submit")),
+        "wait_ms_max": max((r.get("wait_behind_read_ms") or 0) for r in results) if results else None,
+        "read_paused": sum(1 for r in results if r.get("read_paused")),
+        "waited_for_fresh": sum(1 for r in results if r.get("fresh_decision") == "read_first"),
         "mem_peak_gb": max((r.get("mem_peak_gb") or 0) for r in results) or None,
         "fan_max_rpm": max((r.get("fan_max_rpm") or 0) for r in results) if results else None,
         "cap_hits": sum(1 for r in results if r.get("cap_hit")),
@@ -480,11 +552,30 @@ def add_worker_args(ap):
     ap.add_argument("--no-trim", action="store_true", help="keep Kokoro's built-in leading/trailing silence")
     ap.add_argument("--mlx-cache-gb", type=float, default=0.0,
                     help="cap on MLX's reusable buffer cache (default 0; -1 = MLX default, uncapped)")
+    ap.add_argument("--policy", choices=["p0", "p1", "p2"], default="p2",
+                    help="scheduler: p0 MVP baseline, p1 answer waits for the read, p2 pausable reads (default)")
+    ap.add_argument("--freshness", choices=["A", "B", "C"], default="B",
+                    help="p2 when a newer screen is still being read: A finish if close, B always fresh (default), C always fast")
+    ap.add_argument("--fresh-ms", type=float, default=300.0, help="rule A: finish the read if it needs at most this long")
+    ap.add_argument("--layers-per-piece", type=int, default=2, help="text layers per read piece")
+    ap.add_argument("--min-read-interval", type=float, default=0.0, help="rate cap: seconds between read starts (0 = off)")
+    ap.add_argument("--duty-cap", type=float, default=1.0, help="reads may use at most this share of GPU time per minute (1 = off)")
+    ap.add_argument("--show-text", action="store_true",
+                    help="print the transcript and answer in the terminal (the assistant can then read them on screen)")
+    ap.add_argument("--hotkey", choices=["right_option", "right_command", "right_control", "fn", "none"],
+                    default="right_option", help="hold this key in any app to talk (needs Input Monitoring permission)")
+    ap.add_argument("--history", choices=["on", "off", "auto"], default="auto",
+                    help="conversation history in the context: auto = on live, off in replays (independent test questions)")
 
 
 def worker_opts(args) -> dict:
-    return dict(first_chunk=getattr(args, "first_chunk", "phrase"), trim_silence=not getattr(args, "no_trim", False),
-                mlx_cache_gb=None if getattr(args, "mlx_cache_gb", 0.0) < 0 else getattr(args, "mlx_cache_gb", 0.0))
+    g = lambda k, d: getattr(args, k, d)
+    return dict(first_chunk=g("first_chunk", "phrase"), trim_silence=not g("no_trim", False),
+                mlx_cache_gb=None if g("mlx_cache_gb", 0.0) < 0 else g("mlx_cache_gb", 0.0),
+                policy=g("policy", "p2"), freshness=g("freshness", "B"), fresh_ms=g("fresh_ms", 300.0),
+                layers_per_piece=g("layers_per_piece", 2), min_read_interval_s=g("min_read_interval", 0.0),
+                duty_cap=g("duty_cap", 1.0),
+                history={"on": True, "off": False}.get(g("history", "auto"), not g("replay", None)))
 
 
 def main():

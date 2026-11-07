@@ -43,7 +43,7 @@ def run_watcher(frames_at):
     """frames_at(t) -> np array. Steps the watcher on a fake clock for 12 s; returns handed frames."""
     clk = FakeClock()
     got = []
-    w = ScreenWatcher(on_frame=lambda i, t, img: got.append((i, t)),
+    w = ScreenWatcher(rule="mvp", on_frame=lambda i, t, img: got.append((i, t)),
                       grab=lambda: Image.fromarray(frames_at(clk.t)), clock=clk, sleep=clk.sleep)
     state = {}
     while clk.t < 1012:
@@ -92,3 +92,130 @@ def test_capture_dir_private_and_file_deleted(monkeypatch, tmp_path):
 def test_gitignore_covers_private_paths():
     gi = (Path(__file__).resolve().parents[1] / ".gitignore").read_text()
     assert "logs/" in gi and "captures/" in gi
+
+
+def test_talk_key_hands_over_a_change_without_settling():
+    """capture_now (talk key): a changed frame goes to the reader at once, no 0.3 s settle wait."""
+    import numpy as np
+    from PIL import Image
+    import screen as scr
+    frames = [np.zeros((200, 300, 3), np.uint8), np.zeros((200, 300, 3), np.uint8)]
+    frames[1][150:160, 10:20] = 255                     # a small change, not settled yet
+    it = iter(frames)
+    sent = []
+    w = scr.ScreenWatcher(rule="mvp", on_frame=lambda fid, t, img: sent.append(fid),
+                          grab=lambda: Image.fromarray(next(it)), clock=lambda: 100.0, sleep=lambda s: None)
+    state = {}
+    w.step(state)                                        # first frame: always handed over
+    state["force"] = True
+    w.step(state)
+    assert sent == [1, 2] and w.handed[-1]["reason"] == "talk_key"
+
+
+# ---- "cells" rule (default): only changes worth a read
+
+class _Clock:
+    def __init__(self): self.t = 1000.0
+    def __call__(self): return self.t
+
+
+def _cells_watcher(frames):
+    import screen as scr
+    from PIL import Image
+    clock, sent = _Clock(), []
+    state = {"i": 0}
+    def grab():
+        return Image.fromarray(frames[min(state["i"], len(frames) - 1)])
+    w = scr.ScreenWatcher(on_frame=lambda fid, t, img: sent.append((fid, w.handed[-1]["reason"])),
+                          grab=grab, clock=clock, sleep=lambda s: None)
+    return w, clock, sent, state
+
+
+def _run(w, clock, state, seconds, step=0.3, frame_at=None):
+    st = state.setdefault("watcher_state", {})       # the watcher's state persists across calls
+    end = clock.t + seconds
+    while clock.t < end:
+        if frame_at:
+            state["i"] = frame_at(clock.t)
+        w.step(st)
+        clock.t += step
+    return st
+
+
+def _frame(edits=(), size=(1024, 1536)):
+    import numpy as np
+    f = np.full((*size, 3), 255, np.uint8)
+    for (y, x, h, wd) in edits:
+        f[y:y + h, x:x + wd] = 0
+    return f
+
+
+def test_cells_ignore_a_typed_word():
+    base = _frame()
+    word = _frame([(500, 300, 20, 60)])                 # a word: ~2 cells
+    w, clock, sent, state = _cells_watcher([base, word])
+    _run(w, clock, state, 0.3)                           # first frame
+    _run(w, clock, state, 10, frame_at=lambda t: 1)
+    assert [r for _, r in sent] == ["first"]
+
+
+def test_cells_read_a_paragraph_after_quiet():
+    base = _frame()
+    para = _frame([(400 + 30 * i, 100, 20, 1200) for i in range(4)])   # 4 lines across the screen
+    w, clock, sent, state = _cells_watcher([base, para])
+    _run(w, clock, state, 0.3)
+    _run(w, clock, state, 3, frame_at=lambda t: 1)
+    assert [r for _, r in sent] == ["first", "settled"]
+
+
+def test_cells_structural_change_reads_fast():
+    import numpy as np
+    base = _frame()
+    other = np.zeros_like(base)                          # window switch: everything changes
+    w, clock, sent, state = _cells_watcher([base, other])
+    _run(w, clock, state, 0.3)
+    t0 = clock.t
+    _run(w, clock, state, 1.2, frame_at=lambda t: 1)
+    assert sent[-1][1] == "structural" and w.handed[-1]["captured_at"] - t0 <= 1.0
+
+
+def test_cells_animation_is_ignored_and_never_settles_into_reads():
+    a = _frame([(300, 300, 200, 300)])                    # a video region alternating every poll
+    b = _frame([(300, 300, 100, 300)])
+    w, clock, sent, state = _cells_watcher([a, b])
+    _run(w, clock, state, 0.3)
+    _run(w, clock, state, 20, frame_at=lambda t: int(t * 10 / 3) % 2)
+    assert [r for _, r in sent].count("settled") == 0 and len(sent) <= 2
+
+
+def test_cells_staleness_cap_reads_small_lasting_changes():
+    base = _frame()
+    word = _frame([(500, 300, 20, 60)])
+    w, clock, sent, state = _cells_watcher([base, word])
+    _run(w, clock, state, 0.3)
+    _run(w, clock, state, 27, step=1.0, frame_at=lambda t: 1)
+    assert [r for _, r in sent] == ["first", "stale_cap"]
+
+
+def test_cells_talk_key_sends_even_a_tiny_change():
+    base = _frame()
+    word = _frame([(500, 300, 20, 60)])
+    w, clock, sent, state = _cells_watcher([base, word])
+    _run(w, clock, state, 0.3)
+    state["i"] = 1
+    st = state.setdefault("watcher_state", {})
+    st["force"] = True
+    w.step(st)
+    assert sent[-1][1] == "talk_key"
+
+
+def test_window_summary_marks_coverage_and_skips_strips():
+    import screen as scr
+    wins = [{"app": "Terminal", "x": 0, "y": 33, "w": 1512, "h": 68},          # tab strip: skipped
+            {"app": "Terminal", "x": 0, "y": 100, "w": 800, "h": 800},
+            {"app": "Google Chrome", "x": 0, "y": 33, "w": 1512, "h": 876},
+            {"app": "Slack", "x": 100, "y": 150, "w": 600, "h": 600}]
+    s = scr.window_summary(wins)
+    assert s["apps"] == ["Terminal", "Google Chrome", "Slack"]
+    assert s["line"] == ("Open windows, front to back: Terminal; Google Chrome (partly covered); "
+                         "Slack (hidden behind others).")

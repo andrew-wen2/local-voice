@@ -27,8 +27,73 @@ IDLE_POLL_S = 1.0
 ACTIVE_POLL_S = 0.3
 SETTLE_S = 0.3
 MAX_DELAY_S = 3.0
+# "cells" rule (ARCHITECTURE.md §8.4; real-use log 2026-11-06: 13.4 -> 4.5 reads/min vs any-pixel)
+CELL_SCALE = 4              # compare a 4x-shrunk copy...
+CELL_PX = 16                # ...in 16 px cells = 64 screen px, about one image token at 1120
+CELL_MIN = 40               # changed cells needed (or 5% of the screen, whichever is smaller)
+CELL_FRAC = 0.05
+CELL_SETTLE_S = 1.5         # quiet this long before reading
+STRUCTURAL_FRAC = 0.30      # this much changing at once = window switch / scroll / page load
+STRUCTURAL_SETTLE_S = 0.5
+STALE_CAP_S = 25.0          # an unread change is read after this long regardless
+ANIMATED_OF = (5, 10)       # a cell that changed in 5 of the last 10 polls is "animated" and ignored
 MENU_BAR_PX = 80            # Retina menu-bar height incl. margin (device pixels)
 STATUS_AREA_FRAC = 0.30     # right part of the menu bar: clock, battery, Wi-Fi, etc.
+
+
+WINLIST = Path(__file__).resolve().parent / "tools/winlist"
+
+
+def front_apps(limit: int = 4) -> list[str]:
+    """On-screen app windows, front to back: app names only, no titles (tools/winlist)."""
+    try:
+        import json
+        out = subprocess.run([str(WINLIST)], capture_output=True, text=True, timeout=2).stdout
+        return [w["app"] for w in json.loads(out)][:limit]
+    except Exception:
+        return []
+
+
+def _windows() -> list[dict]:
+    try:
+        import json
+        return json.loads(subprocess.run([str(WINLIST)], capture_output=True, text=True, timeout=2).stdout)
+    except Exception:
+        return []
+
+
+def window_summary(wins: Optional[list] = None, screen_pt=(1512, 982), grid_pt: int = 8) -> dict:
+    """Open windows front to back with how much of each is covered, for the model and the log.
+    App names only (no titles). Windows under 100x100 pt (tab strips, palettes) are skipped.
+    Returns {"apps": [...], "line": "Open windows, front to back: A; B (mostly covered); ..."}."""
+    wins = _windows() if wins is None else wins
+    wins = [w for w in wins if w["w"] >= 100 and w["h"] >= 100]
+    gw, gh = screen_pt[0] // grid_pt, screen_pt[1] // grid_pt
+    taken = np.zeros((gh, gw), bool)
+    parts = []
+    for w in wins:                                          # front to back
+        x0, y0 = max(0, int(w["x"] // grid_pt)), max(0, int(w["y"] // grid_pt))
+        x1, y1 = min(gw, int((w["x"] + w["w"]) // grid_pt)), min(gh, int((w["y"] + w["h"]) // grid_pt))
+        area = max(1, (x1 - x0) * (y1 - y0))
+        region = taken[y0:y1, x0:x1]
+        visible = 1 - region.sum() / area if area else 0
+        region[:] = True
+        label = ("" if visible >= 0.9 else " (partly covered)" if visible >= 0.5
+                 else " (mostly covered)" if visible >= 0.05 else " (hidden behind others)")
+        parts.append(w["app"] + label)
+    line = ("Open windows, front to back: " + "; ".join(parts) + ".") if parts else ""
+    return {"apps": [w["app"] for w in wins], "line": line}
+
+
+def active_displays() -> int:
+    """Number of active displays (the capture takes only the main one)."""
+    try:
+        cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        n = ctypes.c_uint32(0)
+        cg.CGGetActiveDisplayList(0, None, ctypes.byref(n))
+        return int(n.value)
+    except Exception:
+        return -1
 
 
 def has_screen_permission() -> bool:
@@ -86,6 +151,25 @@ def change_mask(h: int, w: int) -> np.ndarray:
     return m
 
 
+def shrink(img: Image.Image) -> np.ndarray:
+    return np.asarray(img.reduce(CELL_SCALE))
+
+
+def cell_changes(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Boolean [rows, cols] grid: any pixel differs inside the cell (inputs are shrunk frames)."""
+    h, w = (a.shape[0] // CELL_PX) * CELL_PX, (a.shape[1] // CELL_PX) * CELL_PX
+    d = np.any(a[:h, :w] != b[:h, :w], axis=-1)
+    return d.reshape(h // CELL_PX, CELL_PX, w // CELL_PX, CELL_PX).any(axis=(1, 3))
+
+
+def cell_mask(rows: int, cols: int) -> np.ndarray:
+    """Cells that count: the menu-bar status area (clock, battery) is ignored."""
+    m = np.ones((rows, cols), bool)
+    top = -(-MENU_BAR_PX // (CELL_PX * CELL_SCALE))
+    m[:top, int(cols * (1 - STATUS_AREA_FRAC)):] = False
+    return m
+
+
 def changed(a: np.ndarray, b: np.ndarray, mask: Optional[np.ndarray] = None) -> bool:
     """Any pixel difference where the mask is True (a single character counts)."""
     if a.shape != b.shape:
@@ -103,20 +187,98 @@ class ScreenWatcher(threading.Thread):
     """
 
     def __init__(self, on_frame: Callable, grab: Callable[[], Image.Image],
-                 clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
+                 clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+                 describe: Optional[Callable[[], list]] = None, rule: str = "cells"):
         super().__init__(daemon=True, name="screen-watcher")
         self.on_frame, self.grab, self.clock, self.sleep = on_frame, grab, clock, sleep
+        self.describe = describe              # diagnostics: front apps when a frame is sent
+        assert rule in ("cells", "mvp")
+        self.rule = rule                      # "cells" (default) or "mvp" (any changed pixel)
+        self.last_sent_small: Optional[np.ndarray] = None
+        self.cmask = None
+        self.cstats = {"polls": 0, "animated_cells": 0}
         self.frame_id = 0
         self.handed: list[dict] = []
         self._stop = threading.Event()
         self.last_sent: Optional[np.ndarray] = None
         self.mask = None
+        self._force = threading.Event()
 
     def stop(self):
         self._stop.set()
+        self._force.set()
+
+    def capture_now(self):
+        """Talk key pressed (ARCHITECTURE.md §8.4): capture right away and hand the frame over if it
+        changed since the last one sent, skipping the settle wait. The GPU is idle while you talk."""
+        self._force.set()
 
     def step(self, state: dict) -> float:
         """One poll. Returns how long to sleep before the next poll. `state` carries pending change info."""
+        if self.rule == "cells":
+            return self._step_cells(state)
+        return self._step_mvp(state)
+
+    def _step_cells(self, state: dict) -> float:
+        """Read only changes worth reading (ARCHITECTURE.md §8.4): count changed token-sized cells
+        against the last frame SENT (flicker that reverts cancels out), ignore animated cells, and
+        send when enough changed and it has been quiet for a while, on a structural change after a
+        short settle, after the staleness cap, or at once on the talk key."""
+        t = self.clock()
+        img = self.grab()
+        small = shrink(img)
+        self.cstats["polls"] += 1
+        grid = (small.shape[0] // CELL_PX, small.shape[1] // CELL_PX)
+        if self.cmask is None or self.cmask.shape != grid:
+            self.cmask = cell_mask(*grid)
+        if self.last_sent_small is None or self.last_sent_small.shape != small.shape:
+            self._send(img, None, t, reason="first", small=small)
+            state.clear()
+            state["prev_small"] = small
+            return IDLE_POLL_S
+        prev = state.get("prev_small")
+        if prev is None or prev.shape != small.shape:
+            prev = self.last_sent_small                   # no earlier poll: compare with the last frame sent
+        state["prev_small"] = small
+        ch_prev = cell_changes(small, prev) & self.cmask
+        hist = state.setdefault("hist", [])
+        hist.append(ch_prev)
+        del hist[:-ANIMATED_OF[1]]
+        animated = (np.sum(hist, axis=0) >= ANIMATED_OF[0]) if len(hist) >= ANIMATED_OF[0] else np.zeros_like(ch_prev)
+        self.cstats["animated_cells"] = int(animated.sum())
+        ch_ref = cell_changes(small, self.last_sent_small) & self.cmask
+        if state.pop("force", False):                        # talk key: any change at all, now
+            if ch_ref.any():
+                self._send(img, None, t, reason="talk_key",
+                           waited=t - state["first"] if state.get("first") else 0.0, small=small)
+            state.pop("first", None)
+            return IDLE_POLL_S
+        ch_ref &= ~animated
+        n_ref, n_prev, n = int(ch_ref.sum()), int((ch_prev & ~animated).sum()), int(self.cmask.sum())
+        if n_ref == 0:
+            state.pop("first", None)
+            return IDLE_POLL_S
+        state.setdefault("first", t)
+        if n_prev:
+            state["last_change"] = t
+            if n_prev >= STRUCTURAL_FRAC * n:
+                state["structural"] = True
+        quiet = t - state.get("last_change", state["first"])
+        reason = None
+        if state.get("structural") and quiet >= STRUCTURAL_SETTLE_S:
+            reason = "structural"
+        elif n_ref >= min(CELL_MIN, max(1, int(CELL_FRAC * n))) and quiet >= CELL_SETTLE_S:
+            reason = "settled"
+        elif t - state["first"] >= STALE_CAP_S:
+            reason = "stale_cap"
+        if reason:
+            self._send(img, None, t, reason=reason, waited=t - state["first"], small=small)
+            for k in ("first", "last_change", "structural"):
+                state.pop(k, None)
+            return IDLE_POLL_S
+        return ACTIVE_POLL_S
+
+    def _step_mvp(self, state: dict) -> float:
         t = self.clock()
         img = self.grab()
         arr = np.asarray(img)
@@ -126,6 +288,12 @@ class ScreenWatcher(threading.Thread):
         state["last_seen"] = arr
         if self.last_sent is None:                       # first frame: always hand over
             self._send(img, arr, t, reason="first")
+            return IDLE_POLL_S
+        if state.pop("force", False):                    # talk key: no settle wait
+            if changed(arr, self.last_sent, self.mask):
+                self._send(img, arr, t, reason="talk_key",
+                           waited=t - state["first_change"] if state.get("first_change") else 0.0)
+            state["first_change"] = None
             return IDLE_POLL_S
         if state.get("first_change") is None:
             if changed(arr, self.last_sent, self.mask):
@@ -146,15 +314,29 @@ class ScreenWatcher(threading.Thread):
             return IDLE_POLL_S
         return ACTIVE_POLL_S
 
-    def _send(self, img, arr, t, reason, waited=0.0):
+    def _send(self, img, arr, t, reason, waited=0.0, small=None):
         self.frame_id += 1
         self.last_sent = arr
+        if small is not None:
+            self.last_sent_small = small
+        d = self.describe() if self.describe else None
+        note = d.get("line") if isinstance(d, dict) else None
         self.handed.append({"frame_id": self.frame_id, "captured_at": t, "reason": reason,
-                            "waited_s": round(waited, 3)})
-        self.on_frame(self.frame_id, t, img)
+                            "waited_s": round(waited, 3),
+                            "apps": d.get("apps") if isinstance(d, dict) else d, "note": note})
+        if note:
+            self.on_frame(self.frame_id, t, img, note=note)
+        else:
+            self.on_frame(self.frame_id, t, img)
 
     def run(self):
         state: dict = {}
         while not self._stop.is_set():
+            if self._force.is_set() and not self._stop.is_set():
+                self._force.clear()
+                state["force"] = True
             delay = self.step(state)
-            self.sleep(delay)
+            if self.sleep is time.sleep:                 # real use: wake early on the talk key
+                self._force.wait(delay)
+            else:
+                self.sleep(delay)

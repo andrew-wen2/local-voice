@@ -73,7 +73,7 @@ class FakeTts:
 @pytest.fixture
 def worker(monkeypatch):
     monkeypatch.setattr(engine, "clone_cache", lambda c: list(c))
-    w = engine.GpuWorker(FakeAdapter(), FakeTts(), budget=560)
+    w = engine.GpuWorker(FakeAdapter(), FakeTts(), budget=560, policy="p0")   # MVP baseline tests
     w.start()
     assert w.ready.wait(5)
     yield w
@@ -147,6 +147,173 @@ def test_answer_without_screen_reports_error(monkeypatch):
     w.submit_answer(job)
     assert job.done.wait(3)
     assert job.result["error"] == "no screen read yet"
+    w.stop()
+
+
+# ---------------------------------------------------------------- scheduler (p1 / p2), fake pieces
+
+class FakeStepAdapter(FakeAdapter):
+    """Reads come in `pieces` pieces of `piece_s` seconds each (like read_screen_steps)."""
+    def __init__(self, pieces=10, piece_s=0.03):
+        super().__init__()
+        self.pieces, self.piece_s, self.pieces_run = pieces, piece_s, []
+    def read_screen_steps(self, image, frame_id=0, captured_at=None, layers_per_piece=2, **kw):
+        self.reads_started.append((frame_id, time.time()))
+        for i in range(self.pieces):
+            time.sleep(self.piece_s)
+            self.pieces_run.append((frame_id, i, time.perf_counter()))
+            yield i + 1, self.pieces
+        return engine.Snapshot(frame_id, captured_at or time.time(), time.time(), time.time(), 1120, 10, master=[])
+
+
+def _sched(monkeypatch, **kw):
+    monkeypatch.setattr(engine, "clone_cache", lambda c: list(c))
+    opts = dict(policy="p2", freshness="A", fresh_ms=300.0)
+    opts.update(kw)
+    pieces = opts.pop("pieces", 10)
+    piece_s = opts.pop("piece_s", 0.03)
+    w = engine.GpuWorker(FakeStepAdapter(pieces, piece_s), FakeTts(), **opts)
+    w.start()
+    assert w.ready.wait(5)
+    return w
+
+
+def _read_first(w, fid=1):
+    w.submit_frame(fid, time.time(), "img")
+    deadline = time.time() + 5
+    while (w.snapshot is None or w.snapshot.frame_id != fid) and time.time() < deadline:
+        time.sleep(0.01)
+    assert w.snapshot.frame_id == fid
+
+
+def test_p2_reads_run_during_a_turn(monkeypatch):
+    w = _sched(monkeypatch)
+    w.set_turn_active(True)                      # you are talking: the GPU is idle, so read
+    _read_first(w, 1)
+    w.stop()
+
+
+def test_p2_answer_waits_at_most_one_piece_freshness_c(monkeypatch):
+    w = _sched(monkeypatch, freshness="C", pieces=20, piece_s=0.05)
+    _read_first(w, 1)
+    w.submit_frame(2, time.time(), "img")
+    time.sleep(0.12)                             # read of frame 2 is mid-way
+    job, marks, _ = _job()
+    t_submit = time.perf_counter()
+    w.submit_answer(job)
+    assert job.done.wait(5)
+    r = job.result
+    assert marks["restore_done"] - t_submit < 0.05 + 0.03     # at most one piece (+ slack)
+    assert r["fresh_decision"] == "answer" and r["frame_id"] == 1 and r["stale_vs_submit"] is True
+    assert r.get("read_paused") is True
+    deadline = time.time() + 5                   # the paused read resumes and finishes afterwards
+    while w.snapshot.frame_id != 2 and time.time() < deadline:
+        time.sleep(0.02)
+    assert w.snapshot.frame_id == 2 and w.read_log[-1]["pauses"] == 1
+    w.stop()
+
+
+def test_p2_freshness_a_finishes_a_read_that_is_nearly_done(monkeypatch):
+    w = _sched(monkeypatch, freshness="A", fresh_ms=300, pieces=10, piece_s=0.03)
+    _read_first(w, 1)
+    w.submit_frame(2, time.time(), "img")
+    time.sleep(0.15)                             # ~5 of 10 pieces left: ~150 ms < 300 ms
+    job, _, _ = _job()
+    w.submit_answer(job)
+    assert job.done.wait(5)
+    assert job.result["fresh_decision"] == "read_first"
+    assert job.result["frame_id"] == 2 and job.result["stale_vs_submit"] is False
+    w.stop()
+
+
+def test_p2_freshness_a_answers_stale_when_the_read_is_far_from_done(monkeypatch):
+    w = _sched(monkeypatch, freshness="A", fresh_ms=300, pieces=40, piece_s=0.03)
+    _read_first(w, 1)
+    w.submit_frame(2, time.time(), "img")
+    time.sleep(0.1)                              # ~37 pieces left: ~1.1 s > 300 ms
+    job, _, _ = _job()
+    t_submit = time.perf_counter()
+    w.submit_answer(job)
+    assert job.done.wait(5)
+    assert job.result["fresh_decision"] == "answer" and job.result["frame_id"] == 1
+    assert job.result["wait_behind_read_s"] < 0.1
+    w.stop()
+
+
+def test_p2_freshness_b_always_waits_for_the_new_screen(monkeypatch):
+    w = _sched(monkeypatch, freshness="B", pieces=20, piece_s=0.03)
+    _read_first(w, 1)
+    w.submit_frame(2, time.time(), "img")
+    job, _, _ = _job()
+    w.submit_answer(job)
+    assert job.done.wait(5)
+    assert job.result["fresh_decision"] == "read_first" and job.result["frame_id"] == 2
+    w.stop()
+
+
+def test_p2_latest_frame_drops_a_partial_read(monkeypatch):
+    w = _sched(monkeypatch, pieces=20, piece_s=0.03)
+    w.submit_frame(1, time.time(), "img")
+    time.sleep(0.15)                             # frame 1 read part-way
+    w.submit_frame(2, time.time(), "img")
+    assert w.first_snapshot_wait(5)
+    deadline = time.time() + 5
+    while w.snapshot.frame_id != 2 and time.time() < deadline:
+        time.sleep(0.02)
+    assert w.snapshot.frame_id == 2 and w.stats["reads_dropped"] == 1
+    assert [e["frame_id"] for e in w.read_log] == [2]
+    w.stop()
+
+
+def test_p2_read_an_answer_waits_for_is_not_dropped(monkeypatch):
+    w = _sched(monkeypatch, freshness="B", pieces=20, piece_s=0.03)
+    _read_first(w, 1)
+    w.submit_frame(2, time.time(), "img")
+    job, _, _ = _job()
+    w.submit_answer(job)                         # waits for frame 2
+    time.sleep(0.1)
+    w.submit_frame(3, time.time(), "img")        # must not restart the read the answer waits for
+    assert job.done.wait(5)
+    assert job.result["frame_id"] == 2
+    w.stop()
+
+
+def test_p1_answer_waits_for_the_read_in_progress(monkeypatch):
+    w = _sched(monkeypatch, policy="p1", pieces=15, piece_s=0.03)
+    _read_first(w, 1)
+    w.submit_frame(2, time.time(), "img")
+    time.sleep(0.1)
+    job, _, _ = _job()
+    w.submit_answer(job)
+    assert job.done.wait(5)
+    assert job.result["frame_id"] == 2 and job.result["wait_behind_read_s"] >= 0.2
+    w.stop()
+
+
+def test_rate_cap_spaces_out_read_starts(monkeypatch):
+    w = _sched(monkeypatch, min_read_interval_s=0.5, pieces=2, piece_s=0.01)
+    _read_first(w, 1)
+    w.submit_frame(2, time.time(), "img")
+    deadline = time.time() + 5
+    while (w.snapshot.frame_id != 2) and time.time() < deadline:
+        time.sleep(0.01)
+    starts = [t for _, t in w.adapter.reads_started]
+    assert starts[1] - starts[0] >= 0.45
+    w.stop()
+
+
+def test_duty_cap_defers_reads_but_not_reads_an_answer_needs(monkeypatch):
+    w = _sched(monkeypatch, duty_cap=0.0001, freshness="B", pieces=5, piece_s=0.02)
+    w.duty_cap = 1.0
+    _read_first(w, 1)                            # some read time is now on the books
+    w.duty_cap = 0.0001
+    w.submit_frame(2, time.time(), "img")
+    time.sleep(0.3)
+    assert w.snapshot.frame_id == 1              # deferred by the duty cap
+    job, _, _ = _job()
+    w.submit_answer(job)                         # B: the answer needs frame 2, caps don't apply
+    assert job.done.wait(5)
+    assert job.result["frame_id"] == 2
     w.stop()
 
 
