@@ -411,10 +411,10 @@ class GemmaAdapter:
         cache = yield from self.prefill_text_steps(clone_cache(prefix_cache), ids, layers_per_piece)
         return cache
 
-    def encode_steps(self, image, note: Optional[str] = None):
+    def encode_steps(self, image, note: Optional[str] = None, inp=None):
         """Image prep + vision encoder in pieces (patch embedding, 16 layers, pooling).
-        Returns (inputs of the screen turn without <bos>, image tokens)."""
-        inp = self._inputs(image, self.screen_turn_prompt(note))
+        Returns (inputs of the screen turn without <bos>, image tokens). `inp`: already-prepared inputs."""
+        inp = inp if inp is not None else self._inputs(image, self.screen_turn_prompt(note))
         yield None
         vt = self.model.vision_tower
         pixel_values = inp["pixel_values"]
@@ -439,6 +439,35 @@ class GemmaAdapter:
         valid_mask = pool_mask if pool_mask.shape[1] == output_length else ~pool_mask
         real = [pooled[i, :int(valid_mask[i].astype(mx.int32).sum().item())] for i in range(B)]
         feats = mx.concatenate(real, axis=0)[None]
+        if vt.config.standardize:
+            feats = (feats - vt.std_bias) * vt.std_scale
+        feats = self.model.embed_vision(feats)
+        mx.eval(feats)
+        yield None
+        return inp, feats
+
+    def encode_steps_ane(self, image, ane, note: Optional[str] = None):
+        """encode_steps with the vision tower on the Neural Engine (ane_vision.AneVisionEncoder, §6.1).
+        Pieces: image prep, one per Core ML chunk (blocking calls, GPU idle), embed_vision on the GPU.
+        Falls back to encode_steps when no converted bucket matches the image's processed size.
+        Sets self.last_encode to 'ane' or 'gpu'."""
+        inp = self._inputs(image, self.screen_turn_prompt(note))
+        pv = inp["pixel_values"]
+        if ane is None or not ane.has(int(pv.shape[2]), int(pv.shape[3])):
+            self.last_encode = "gpu"
+            return (yield from self.encode_steps(image, note, inp=inp))
+        self.last_encode = "ane"
+        yield None
+        g = ane.encode_steps(np.asarray(pv, dtype=np.float32))
+        while True:
+            try:
+                next(g)
+            except StopIteration as e:
+                tokens = e.value
+                break
+            yield None
+        vt = self.model.vision_tower
+        feats = mx.array(tokens).astype(vt.patch_embedder.input_proj.weight.dtype)
         if vt.config.standardize:
             feats = (feats - vt.std_bias) * vt.std_scale
         feats = self.model.embed_vision(feats)
