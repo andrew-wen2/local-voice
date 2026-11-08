@@ -225,7 +225,9 @@ class GemmaAdapter:
     name = "gemma-4-e4b-it-4bit"
 
     def __init__(self, path: Path = GEMMA_PATH, instruction: str = SPOKEN_INSTRUCTION,
-                 skip_audio: bool = True, skip_shared: bool = True, stream_ple: bool = True):
+                 skip_audio: bool = True, skip_shared: bool = True, stream_ple: bool = True,
+                 fast_vision: bool = True, compile_vision: bool = True,
+                 vision_kernel: bool = True):
         self.path = Path(path)
         self.instruction = instruction
         self.model = self.processor = None
@@ -237,6 +239,13 @@ class GemmaAdapter:
         self.skip_shared = skip_shared
         # M2 (§3.4): read the 1.59 GB per-layer embedding table's rows from the model file on demand.
         self.stream_ple = stream_ple
+        # Kernel track (§4.4, vision_fast.py): position lookup as a gather and no all-zero attention mask
+        # (bit-identical); compile_vision also runs each vision layer under mx.compile: not bit-identical, but
+        # as close to an fp32 run as the uncompiled path (0.7-1.8% RMS each), 19/20 reading either way (§4.4).
+        self.fast_vision = fast_vision
+        self.compile_vision = compile_vision
+        # Custom Metal kernel for the vision q/k/v norm + 2D RoPE + layout (kernels/vision_qkv.py, §4.4).
+        self.vision_kernel = vision_kernel
 
     # -- setup
     def load(self):
@@ -257,12 +266,35 @@ class GemmaAdapter:
             del old
         if lazy:
             mx.eval(self.model.parameters())
+        if self.fast_vision:
+            import vision_fast
+            vision_fast.enable(self.model.vision_tower, compile_layers=self.compile_vision, kernel=self.vision_kernel)
         self.lm = self.model.language_model
         self.tok = self.processor.tokenizer
         vocab = self.tok.get_vocab()
         self.stop_ids = {self.tok.eos_token_id} | {
             self.tok.convert_tokens_to_ids(t) for t in ("<turn|>", "<end_of_turn>") if t in vocab}
         return self
+
+    def _vision_mask(self, padding_positions, valid, dtype):
+        if self.fast_vision:
+            import vision_fast
+            return vision_fast.vision_mask(padding_positions, dtype)
+        m = mx.expand_dims(valid, 1) * mx.expand_dims(valid, 2)
+        m = mx.where(m, mx.array(0.0, dtype=dtype), mx.array(-1e4, dtype=dtype))
+        return mx.expand_dims(m, 1)
+
+    def _vision_rope(self, patch_positions):
+        if self.fast_vision:
+            import vision_fast
+            return vision_fast.rope_for(self.model.vision_tower, patch_positions)
+        return None
+
+    def _vision_layer(self, layer):
+        if self.fast_vision:
+            import vision_fast
+            return vision_fast.layer_fn(layer, self.compile_vision, self.vision_kernel)
+        return lambda h, pos, mask, rope=None: layer(h, pos, mask)
 
     def set_budget(self, n: int):
         self.processor.image_processor.max_soft_tokens = n
@@ -435,13 +467,12 @@ class GemmaAdapter:
             h = mx.array(np.ascontiguousarray(np.asarray(x)[:, :, 0, :].transpose(0, 2, 1)))
             h = h.astype(vt.patch_embedder.input_proj.weight.dtype)
         valid = ~padding_positions
-        attn_mask = mx.expand_dims(valid, 1) * mx.expand_dims(valid, 2)
-        attn_mask = mx.where(attn_mask, mx.array(0.0, dtype=h.dtype), mx.array(-1e4, dtype=h.dtype))
-        attn_mask = mx.expand_dims(attn_mask, 1)
-        mx.eval(h, attn_mask)
+        attn_mask = self._vision_mask(padding_positions, valid, h.dtype)
+        rope = self._vision_rope(patch_positions)
+        mx.eval(h, attn_mask, rope)
         yield None
         for layer in vt.encoder.layers[start:]:
-            h = layer(h, patch_positions, attn_mask)
+            h = self._vision_layer(layer)(h, patch_positions, attn_mask, rope)
             mx.eval(h)
             yield None
         pooled, pool_mask = vt.pooler(h, patch_positions, padding_positions, output_length=output_length)
@@ -561,15 +592,14 @@ class GemmaAdapter:
         padding_positions = mx.array(np.tile(padding_mask[None], (B, 1)))
         h = vt.patch_embedder(pixel_values, patch_positions, padding_positions)
         valid = ~padding_positions
-        attn_mask = mx.expand_dims(valid, 1) * mx.expand_dims(valid, 2)
-        attn_mask = mx.where(attn_mask, mx.array(0.0, dtype=h.dtype), mx.array(-1e4, dtype=h.dtype))
-        attn_mask = mx.expand_dims(attn_mask, 1)
-        mx.eval(h, attn_mask)
+        attn_mask = self._vision_mask(padding_positions, valid, h.dtype)
+        rope = self._vision_rope(patch_positions)
+        mx.eval(h, attn_mask, rope)
         done += 1
         yield done, total
 
         for layer in layers:                                   # one vision layer per piece
-            h = layer(h, patch_positions, attn_mask)
+            h = self._vision_layer(layer)(h, patch_positions, attn_mask, rope)
             mx.eval(h)
             done += 1
             yield done, total
