@@ -66,10 +66,13 @@ def layer_fn(layer, compiled: bool, kernel: bool = False):
         return plain
     key = (id(layer), kernel)
     if key not in _compiled:
+        # inputs=layer.state: the layer's weights are inputs read at every call, not constants frozen at the
+        # first trace, so weights swapped in and out (ARCHITECTURE.md §3.9) are used and freed correctly.
         if kernel:
-            _compiled[key] = mx.compile(lambda h, pos, c, s: block_forward(layer, h, pos, None, (c, s)))
+            _compiled[key] = mx.compile(lambda h, pos, c, s: block_forward(layer, h, pos, None, (c, s)),
+                                        inputs=layer.state)
         else:
-            _compiled[key] = mx.compile(lambda h, pos: layer(h, pos, None))
+            _compiled[key] = mx.compile(lambda h, pos: layer(h, pos, None), inputs=layer.state)
     fn = _compiled[key]
 
     def call(h, pos, mask, rope=None):

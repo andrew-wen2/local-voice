@@ -21,11 +21,12 @@ PY313=$(command -v python3.13 || true)
 .venv/bin/python -m pip install -q --upgrade pip
 .venv/bin/python -m pip install -q -r requirements.txt
 
-step "Swift helpers (window list, push-to-talk key, speech recognition server)"
+step "Swift helpers (window list, push-to-talk key, speech recognition and speech output servers)"
 command -v swiftc >/dev/null || { echo "Swift not found: run 'xcode-select --install' and re-run."; exit 1; }
 [[ -x tools/winlist ]] || swiftc -O tools/winlist.swift -o tools/winlist
 [[ -x tools/hotkey ]] || swiftc -O tools/hotkey.swift -o tools/hotkey
-[[ -x tools/parakeet/.build/release/parakeet-serve ]] || (cd tools/parakeet && swift build -c release)
+[[ -x tools/parakeet/.build/release/parakeet-serve && -x tools/parakeet/.build/release/kokoro-serve ]] || \
+  (cd tools/parakeet && swift build -c release)
 
 step "Models (pinned Hugging Face revisions)"
 HF=.venv/bin/hf
@@ -39,6 +40,14 @@ if [[ -d models/parakeet-tdt-0.6b-v2/Encoder.mlmodelc ]]; then
   echo "  models/parakeet-tdt-0.6b-v2: present"
 else   # Core ML bundles via FluidAudio 0.18.2 (pinned in tools/parakeet/Package.swift)
   tools/parakeet/.build/release/parakeet-serve --models models/parakeet-tdt-0.6b-v2 --download
+fi
+if [[ ! -f models/gemma-4-e4b-it-4bit/indexed_scales.safetensors ]]; then   # lossless scale index (§3.8), ~3 s
+  .venv/bin/python -m kernels.indexed_qmv build
+fi
+if [[ -d models/kokoro-coreml/kokoro-82m-coreml ]]; then
+  echo "  models/kokoro-coreml: present"
+else   # Kokoro on the Neural Engine (the default speech output), via FluidAudio 0.18.2
+  tools/parakeet/.build/release/kokoro-serve --models models/kokoro-coreml --download
 fi
 
 if (( EXTRAS )); then
@@ -62,6 +71,7 @@ cat <<'MSG'
 Done. Before the first run, allow the terminal app in System Settings > Privacy & Security:
   Screen & System Audio Recording (reading the screen), Microphone (your question),
   Input Monitoring (hold Right Option anywhere to talk; optional, Enter works too).
-Then:  .venv/bin/python app.py
+Then:  .venv/bin/python menubar.py   (menu bar icon: Turn On / Turn Off; Off wipes what it saw)
+   or:  .venv/bin/python app.py       (same assistant, run in the terminal)
 Benchmark screens (optional, needs Google Chrome): .venv/bin/python eval/recall/make_sessions.py --sessions h1,h2,h3,h4
 MSG

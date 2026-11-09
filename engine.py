@@ -38,6 +38,7 @@ if os.environ.get("LV_ALLOW_TORCH") != "1":
     sys.modules.setdefault("torch", None)
 
 import mlx.core as mx  # noqa: E402
+import mlx.nn as nn  # noqa: E402
 import numpy as np  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
@@ -181,6 +182,66 @@ class MMapPerLayerEmbedding:
         return deq[mx.array(inv.astype(np.int32))].reshape(*ids_np.shape, deq.shape[-1])
 
 
+def _uses(part: str):
+    """Mark a GemmaAdapter method as needing one swappable part ("vision" or "head") loaded (§3.9).
+    Works for generators too: the part is acquired on the first step and released when the generator ends
+    or is dropped (finally runs on close / garbage collection)."""
+    import functools
+    import inspect
+
+    def deco(fn):
+        if inspect.isgeneratorfunction(fn):
+            @functools.wraps(fn)
+            def gen_wrapper(self, *a, **k):
+                self._acquire(part)
+                try:
+                    return (yield from fn(self, *a, **k))
+                finally:
+                    self._release(part)
+            return gen_wrapper
+
+        @functools.wraps(fn)
+        def wrapper(self, *a, **k):
+            self._acquire(part)
+            try:
+                return fn(self, *a, **k)
+            finally:
+                self._release(part)
+        return wrapper
+    return deco
+
+
+class SwappableEmbedding(nn.Module):
+    """Gemma's token embedding, which is also its output layer (tied, 262,144 rows, 4-bit: 0.34 GB of codes).
+    Input lookups read the rows they need from the model file (as the per-layer table, M2: bit-identical); the
+    full table is only needed for the output layer, so its codes can be swapped out while the image encoder is
+    in (§3.9). as_linear loads them on demand if they are out. Scales/biases (or the §3.8 index) stay in."""
+
+    def __init__(self, qe, file: Path, prefix: str, loader):
+        super().__init__()
+        self.weight = qe["weight"]
+        if "idx" in qe:
+            self.idx, self.table = qe["idx"], qe["table"]
+        else:
+            self.scales, self.biases = qe["scales"], qe["biases"]
+        self.group_size, self.bits = 64, 4
+        self._rows = MMapPerLayerEmbedding(file, prefix, 64, 4)
+        self._loader = loader
+        self.freeze()
+
+    def __call__(self, ids):
+        return self._rows(ids)
+
+    def as_linear(self, x):
+        if self["weight"].size == 0:
+            self._loader("head")
+        if "idx" in self:
+            from kernels.indexed_qmv import indexed_matmul
+            return indexed_matmul(x, self["weight"], self["idx"], self["table"])
+        return mx.quantized_matmul(x, self["weight"], scales=self["scales"], biases=self["biases"], transpose=True,
+                                   group_size=self.group_size, bits=self.bits)
+
+
 class _audio_config_off:
     """Load Gemma with audio_config = None, so mlx-vlm never builds the audio tower and its
     sanitize step drops the audio weights (mlx_vlm/models/gemma4/gemma4.py:61-73, :269).
@@ -227,7 +288,8 @@ class GemmaAdapter:
     def __init__(self, path: Path = GEMMA_PATH, instruction: str = SPOKEN_INSTRUCTION,
                  skip_audio: bool = True, skip_shared: bool = True, stream_ple: bool = True,
                  fast_vision: bool = True, compile_vision: bool = True,
-                 vision_kernel: bool = True):
+                 vision_kernel: bool = True, vision_bits: int = 16, indexed_scales: bool = True,
+                 swap_weights: bool = False):
         self.path = Path(path)
         self.instruction = instruction
         self.model = self.processor = None
@@ -246,6 +308,17 @@ class GemmaAdapter:
         self.compile_vision = compile_vision
         # Custom Metal kernel for the vision q/k/v norm + 2D RoPE + layout (kernels/vision_qkv.py, §4.4).
         self.vision_kernel = vision_kernel
+        # §3.7: the image encoder's linear layers at 8-bit (group 64) save 139 MB; output features change about
+        # as much as compile_vision does. 16 = as shipped (bf16).
+        assert vision_bits in (16, 8, 4)
+        self.vision_bits = vision_bits
+        # §3.8: store each text weight tensor's (scale, bias) pairs as a 16-bit index into a per-tensor table
+        # (lossless; -143 MB); one-token matmuls run kernels/indexed_qmv.py, bit-identical to MLX's. Needs the
+        # setup-time sidecar (python -m kernels.indexed_qmv build); skipped without it.
+        self.indexed_scales = indexed_scales
+        # §3.9: the image encoder (0.34 GB) is needed only while encoding a screen, the output layer (0.34 GB of
+        # codes) only to pick tokens; keep one in at a time. Needs bf16 vision weights (vision_bits 16).
+        self.swap_weights = swap_weights and vision_bits == 16
 
     # -- setup
     def load(self):
@@ -264,11 +337,30 @@ class GemmaAdapter:
             tm.embed_tokens_per_layer = MMapPerLayerEmbedding(files[0], "language_model.model.embed_tokens_per_layer",
                                                               old.group_size, old.bits, getattr(old, "mode", "affine"))
             del old
+        if self.vision_bits < 16:
+            import mlx.nn as nn
+            # input_proj stays bf16: mlx-vlm casts image patches to input_proj.weight.dtype (vision.py:314),
+            # which would be a packed integer type once quantized.
+            nn.quantize(self.model.vision_tower, group_size=64, bits=self.vision_bits,
+                        class_predicate=lambda p, m: isinstance(m, nn.Linear) and m.weight.shape[-1] % 64 == 0
+                        and "input_proj" not in p)
+        if self.indexed_scales:
+            # Before evaluating: with the setup-time sidecar, the old scales/biases are never read at all.
+            from kernels.indexed_qmv import index_scales, sidecar_path
+            t = time.perf_counter()
+            side = sidecar_path(self.path)
+            if side.exists():
+                r = index_scales(self.model.language_model, prefix="language_model.", sidecar=mx.load(str(side)))
+                self.indexed_info = {**r, "seconds": round(time.perf_counter() - t, 2)}
+            else:
+                self.indexed_info = {"skipped": f"{side.name} missing (python -m kernels.indexed_qmv build)"}
         if lazy:
             mx.eval(self.model.parameters())
         if self.fast_vision:
             import vision_fast
             vision_fast.enable(self.model.vision_tower, compile_layers=self.compile_vision, kernel=self.vision_kernel)
+        if self.swap_weights:
+            self._swap_init()
         self.lm = self.model.language_model
         self.tok = self.processor.tokenizer
         vocab = self.tok.get_vocab()
@@ -320,10 +412,69 @@ class GemmaAdapter:
         assert full.startswith(pre)
         return self.tok.encode(full[len(pre):], add_special_tokens=False)
 
+    # -- §3.9: swap the image encoder and the output layer
+    def _swap_init(self):
+        from mlx.utils import tree_flatten
+        self._model_file = next(p for p in self.path.glob("*.safetensors") if p.name != "indexed_scales.safetensors")
+        self._vision_keys = {k: v.dtype for k, v in tree_flatten(self.model.vision_tower.parameters()) if v.size >= 65536}
+        tm = self.model.language_model.model
+        tm.embed_tokens = SwappableEmbedding(tm.embed_tokens, self._model_file, "language_model.model.embed_tokens",
+                                             self._load_part)
+        self._use = {"vision": 0, "head": 0}
+        self._resident = {"vision": True, "head": True}
+        self.swap_log: list = []
+        self._unload_part("vision")                  # out until the first encode asks for it
+
+    def _load_part(self, part: str):
+        from mlx.utils import tree_unflatten
+        t = time.perf_counter()
+        w = mx.load(str(self._model_file))           # lazy: only the arrays used below are read
+        if part == "vision":
+            vt = self.model.vision_tower
+            vt.update(tree_unflatten([(k, w["vision_tower." + k]) for k in self._vision_keys]))
+            mx.eval(vt.parameters())
+        else:
+            emb = self.model.language_model.model.embed_tokens
+            emb.weight = w["language_model.model.embed_tokens.weight"]
+            mx.eval(emb.weight)
+        del w
+        self._resident[part] = True
+        self.swap_log.append((part, "in", round(time.perf_counter() - t, 4)))
+
+    def _unload_part(self, part: str):
+        from mlx.utils import tree_unflatten
+        if part == "vision":
+            self.model.vision_tower.update(tree_unflatten([(k, mx.zeros((0,), dtype=dt))
+                                                           for k, dt in self._vision_keys.items()]))
+        else:
+            self.model.language_model.model.embed_tokens.weight = mx.zeros((0,), dtype=mx.uint32)
+        self._resident[part] = False
+        self.swap_log.append((part, "out", 0.0))
+
+    def _acquire(self, part: str):
+        if not self.swap_weights:
+            return
+        self._use[part] += 1
+        if not self._resident[part]:
+            self._load_part(part)
+        other = "head" if part == "vision" else "vision"
+        if self._resident[other] and self._use[other] == 0:
+            self._unload_part(other)
+
+    def _release(self, part: str):
+        if not self.swap_weights:
+            return
+        self._use[part] -= 1
+        if part == "vision" and self._use["vision"] == 0:
+            self._unload_part("vision")
+            if not self._resident["head"]:           # the output layer is the default resident part
+                self._load_part("head")
+
     def _inputs(self, image, prompt: str):
         from mlx_vlm.utils import prepare_inputs
         return prepare_inputs(self.processor, images=[image], prompts=[prompt])
 
+    @_uses("vision")
     def _prefill(self, inp, upto: Optional[int] = None):
         """Encode the image and prefill input_ids[:upto] into a fresh cache. Returns (cache, n)."""
         ids = inp["input_ids"]
@@ -348,6 +499,7 @@ class GemmaAdapter:
                         read_done=time.time(), budget=getattr(self, "budget", None),
                         prefix_len=n, master=cache)
 
+    @_uses("head")
     def generate(self, cache, ids: list[int], cancel: Optional[threading.Event] = None,
                  max_tokens: int = MAX_TOKENS, max_sentences: int = MAX_SENTENCES,
                  on_first_token: Optional[Callable[[], None]] = None) -> Iterator[str]:
@@ -443,6 +595,7 @@ class GemmaAdapter:
         cache = yield from self.prefill_text_steps(clone_cache(prefix_cache), ids, layers_per_piece)
         return cache
 
+    @_uses("vision")
     def encode_steps(self, image, note: Optional[str] = None, inp=None, resume=None):
         """Image prep + vision encoder in pieces (patch embedding, 16 layers, pooling).
         Returns (inputs of the screen turn without <bos>, image tokens). `inp`: already-prepared inputs.
@@ -551,6 +704,7 @@ class GemmaAdapter:
         return 1 + 1 + len(self.model.vision_tower.encoder.layers) + 1 + 1 + \
             -(-tm.first_kv_shared_layer_idx // layers_per_piece)
 
+    @_uses("vision")
     def read_screen_steps(self, image, frame_id: int = 0, captured_at: Optional[float] = None,
                           layers_per_piece: int = 2, split: str = "layers", chunk: int = 256):
         """The same read as read_screen, split into pieces the scheduler can pause between.
@@ -701,6 +855,140 @@ class Tts:
                 a = trim_silence(a, r.sample_rate, lead_keep_ms=30 if first else 1e9, tail_keep_ms=tail_keep_ms)
             first = False
             yield a
+
+
+KOKORO_ANE_BIN = ROOT / "tools/parakeet/.build/release/kokoro-serve"
+KOKORO_ANE_DIR = ROOT / "models/kokoro-coreml"
+
+
+class AneTts:
+    """Kokoro 82M through FluidAudio's KokoroAne (Core ML: Neural Engine + CPU), as a child process
+    (`tools/parakeet/Sources/kokoro-serve`). Same interface as Tts. No GPU time and no MLX memory:
+    0.19 GB loaded, 0.32 GB peak for the whole process, against MLX Kokoro's 0.33 GB + 0.4-1.7 GB of
+    scratch per sentence (ARCHITECTURE.md §3.7). Text-to-phonemes runs in Swift, so Python never imports
+    mlx_audio / misaki / spaCy.
+
+    Protocol: one UTF-8 line of text in; one "@@" + JSON line {"n", "seconds", "audio_s"} then n float32
+    little-endian samples (24 kHz) out. Other stdout lines are library logging."""
+
+    def __init__(self, binary: Path = KOKORO_ANE_BIN, model_dir: Path = KOKORO_ANE_DIR,
+                 sandbox_profile: Optional[Path] = None, log_path: Optional[Path] = None):
+        self.binary, self.model_dir = Path(binary), Path(model_dir)
+        self.sandbox_profile, self.log_path = sandbox_profile, log_path
+        self.proc = None
+        self.sample_rate = 24000
+        self.startup: dict = {}
+        self.failures: list[dict] = []
+
+    def available(self) -> bool:
+        return self.binary.exists() and (self.model_dir / "kokoro-82m-coreml").exists()
+
+    def load(self, timeout_s: float = 120):
+        import subprocess
+        if not self.available():
+            raise RuntimeError(f"Kokoro on the Neural Engine needs {self.binary} (swift build -c release "
+                               f"--package-path tools/parakeet) and models in {self.model_dir} "
+                               f"({self.binary} --models {self.model_dir} --download)")
+        cmd = [str(self.binary), "--models", str(self.model_dir)]
+        if self.sandbox_profile is not None:
+            cmd = ["sandbox-exec", "-f", str(self.sandbox_profile)] + cmd
+        log = open(self.log_path, "ab") if self.log_path else subprocess.DEVNULL
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+        t0 = time.time()
+        r = self._reply(timeout_s)
+        if not r.get("ready"):
+            self.stop()
+            raise RuntimeError(f"Kokoro (Neural Engine) failed to start: {r}")
+        self.startup = {**r, "start_s": round(time.time() - t0, 2)}
+        return self
+
+    def _reply(self, timeout_s: float = 30) -> dict:
+        """Next "@@" JSON line from the child, skipping library logging."""
+        import json
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            line = self.proc.stdout.readline()
+            if not line:
+                return {"error": f"kokoro-serve exited (code {self.proc.poll()})"}
+            if line.startswith(b"@@"):
+                return json.loads(line[2:])
+        return {"error": "timeout"}
+
+    def pid(self) -> Optional[int]:
+        return self.proc.pid if self.proc is not None and self.proc.poll() is None else None
+
+    def _request(self, text: str):
+        """(samples or None, reply). A dead helper gives (None, {"error": ...})."""
+        try:
+            self.proc.stdin.write(text.encode("utf-8") + b"\n")
+            self.proc.stdin.flush()
+        except (OSError, AttributeError) as e:
+            return None, {"error": f"write failed: {e!r}"}
+        r = self._reply()
+        n = int(r.get("n", 0))
+        if n <= 0:
+            return None, r
+        raw = self.proc.stdout.read(4 * n)
+        if len(raw) != 4 * n:
+            return None, {"error": "short read"}
+        return raw, r
+
+    def synth(self, sentence: str, cancel: Optional[threading.Event] = None, trim: bool = True,
+              tail_keep_ms: float = 120) -> Iterator[np.ndarray]:
+        """Yields the sentence's audio as one chunk (trimmed like Tts.synth). Never raises for a helper failure:
+        a dead helper is restarted and the text retried once; if that fails too, this text is skipped (no audio)
+        and the failure counted in self.failures, so one bad sentence can't stop the GPU worker."""
+        if cancel is not None and cancel.is_set():
+            return
+        text = " ".join(sentence.split())               # one line per request
+        if not text:
+            return
+        raw, r = self._request(text)
+        if raw is None and "error" in r:
+            self.failures.append({"text": text, "error": r["error"]})
+            try:
+                self.stop()
+                self.load()
+                raw, r = self._request(text)
+            except Exception as e:                      # couldn't restart: skip this text
+                r = {"error": repr(e)}
+            if raw is None:
+                self.failures[-1]["retry_error"] = r.get("error")
+                return
+        if raw is None:
+            return
+        a = np.frombuffer(raw, dtype="<f4").astype(np.float32)
+        if cancel is not None and cancel.is_set():
+            return
+        if trim:
+            a = trim_silence(a, self.sample_rate, lead_keep_ms=30, tail_keep_ms=tail_keep_ms)
+        yield a
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        if p is None:
+            return
+        for f in (p.stdin, p.stdout):                  # closing stdin ends the helper's read loop
+            try:
+                f.close()
+            except OSError:                             # already dead: nothing left to flush
+                pass
+        try:
+            p.wait(5)
+        except Exception:
+            p.kill()
+
+
+def make_tts(kind: str = "ane", sandbox_profile: Optional[Path] = None, log_dir: Optional[Path] = None):
+    """kind: 'ane' (default; Kokoro on the Neural Engine) or 'mlx' (Kokoro on the GPU). 'ane' falls back to
+    'mlx' with a message if its binary or models are missing."""
+    if kind == "ane":
+        t = AneTts(sandbox_profile=sandbox_profile, log_path=log_dir / "kokoro.log" if log_dir else None)
+        if t.available():
+            return t
+        print(f"Kokoro on the Neural Engine isn't set up ({t.binary}, {t.model_dir}); using MLX Kokoro. "
+              f"Run ./setup.sh to set it up.", flush=True)
+    return Tts()
 
 
 # ---------------------------------------------------------------- the GPU worker
@@ -996,7 +1284,15 @@ class GpuWorker(threading.Thread):
                     finally:
                         done.set()
                 elif action[0] == "answer":
-                    self._answer(action[1])
+                    job = action[1]
+                    try:
+                        self._answer(job)
+                    except Exception as e:              # one failed answer must not stop the worker (§3.7):
+                        import traceback                # the job ends with an error, the loop goes on
+                        traceback.print_exc()
+                        job.result["error"] = f"answer failed: {e!r}"
+                        self.stats["answer_errors"] = self.stats.get("answer_errors", 0) + 1
+                        job.done.set()
                 elif action[0] == "spare":
                     self._make_spare()
                 else:
