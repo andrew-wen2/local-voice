@@ -14,3 +14,4 @@ tools/hotkey
 tools/parakeet/.build/
 eval/recall/sessions/*/html/
 eval/recall/sessions/*/png/
+eval/recall/sessions/*/ocr-*.json

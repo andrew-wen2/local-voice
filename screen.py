@@ -144,6 +144,167 @@ class Capturer:
         self.dir.rmdir()
 
 
+_OUTPUT_CLASS = None
+
+
+def _stream_output_class():
+    """The SCStreamOutput receiver, defined once per process (Objective-C classes can't be redefined)."""
+    global _OUTPUT_CLASS
+    if _OUTPUT_CLASS is not None:
+        return _OUTPUT_CLASS
+    import CoreMedia
+    import objc
+    import Quartz
+    import ScreenCaptureKit as SCK
+    from Foundation import NSObject
+
+    class LocalVoiceStreamOutput(NSObject, protocols=[objc.protocolNamed("SCStreamOutput")]):
+        owner = None                                  # the StreamCapturer (a Python attribute)
+
+        def stream_didOutputSampleBuffer_ofType_(self, stream, sb, kind):
+            owner = self.owner
+            if owner is None:
+                return
+            atts = CoreMedia.CMSampleBufferGetSampleAttachmentsArray(sb, False)
+            if not atts or atts[0].get(SCK.SCStreamFrameInfoStatus) != SCK.SCFrameStatusComplete:
+                return                                # idle / blank frames carry no new pixels
+            pb = CoreMedia.CMSampleBufferGetImageBuffer(sb)
+            Quartz.CVPixelBufferLockBaseAddress(pb, 1)
+            try:
+                h, w = Quartz.CVPixelBufferGetHeight(pb), Quartz.CVPixelBufferGetWidth(pb)
+                bpr = Quartz.CVPixelBufferGetBytesPerRow(pb)
+                raw = np.frombuffer(Quartz.CVPixelBufferGetBaseAddress(pb).as_buffer(bpr * h), np.uint8)
+                rgb = raw.reshape(h, bpr)[:, :w * 4].reshape(h, w, 4)[:, :, 2::-1].copy()
+            finally:
+                Quartz.CVPixelBufferUnlockBaseAddress(pb, 1)
+            with owner._lock:
+                owner._latest = rgb
+                owner.stats["stream_frames"] += 1
+
+    _OUTPUT_CLASS = LocalVoiceStreamOutput
+    return _OUTPUT_CLASS
+
+
+class StreamCapturer:
+    """ScreenCaptureKit, in process (ARCHITECTURE.md §8.6): one stream of the main display, scaled by macOS
+    to the change gate's size (1/CELL_SCALE), delivered only when something on screen changed, at most every
+    `interval_s`; and a full-resolution screenshot (SCScreenshotManager) only when a frame is handed over.
+    No files, no process per poll. Frames stay in memory (D4).
+
+      cap = StreamCapturer().start()
+      ScreenWatcher(on_frame, grab=cap.grab, grab_small=cap.grab_small)
+    """
+
+    def __init__(self, interval_s: float = ACTIVE_POLL_S, timeout_s: float = 5.0):
+        self.interval_s, self.timeout_s = interval_s, timeout_s
+        self.stats = {"n": 0, "total_s": 0.0, "max_s": 0.0, "cpu_s": 0.0, "stream_frames": 0, "small_reads": 0}
+        self._latest: Optional[np.ndarray] = None
+        self._lock = threading.Lock()
+        self._stream = self._filter = self._full_cfg = None
+
+    @staticmethod
+    def _wait(start, timeout):
+        ev, box = threading.Event(), {}
+
+        def done(*a):
+            box["a"] = a
+            ev.set()
+        start(done)
+        if not ev.wait(timeout):
+            raise TimeoutError("ScreenCaptureKit did not answer")
+        return box["a"]
+
+    def start(self) -> "StreamCapturer":
+        import CoreMedia
+        import libdispatch
+        import Quartz
+        import ScreenCaptureKit as SCK
+
+        content, err = self._wait(lambda h: SCK.SCShareableContent.
+                                  getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+                                      False, True, h), self.timeout_s)
+        if content is None:
+            raise RuntimeError(f"no shareable content: {err}")
+        main = Quartz.CGMainDisplayID()
+        display = next(d for d in content.displays() if d.displayID() == main)
+        self._filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(display, [])
+        scale = 2                                     # device px per point (Retina); full = points * scale
+        full_w, full_h = display.width() * scale, display.height() * scale
+        cfg = SCK.SCStreamConfiguration.alloc().init()
+        cfg.setWidth_(full_w // CELL_SCALE)
+        cfg.setHeight_(full_h // CELL_SCALE)
+        cfg.setMinimumFrameInterval_(CoreMedia.CMTimeMake(int(round(self.interval_s * 1000)), 1000))
+        cfg.setPixelFormat_(1111970369)               # kCVPixelFormatType_32BGRA
+        cfg.setShowsCursor_(False)
+        cfg.setQueueDepth_(3)
+        self._full_cfg = SCK.SCStreamConfiguration.alloc().init()
+        self._full_cfg.setWidth_(full_w)
+        self._full_cfg.setHeight_(full_h)
+        self._full_cfg.setShowsCursor_(False)
+        self._out = _stream_output_class().alloc().init()
+        self._out.owner = self
+        self._queue = libdispatch.dispatch_queue_create(b"localvoice.sck", None)
+        self._stream = SCK.SCStream.alloc().initWithFilter_configuration_delegate_(self._filter, cfg, None)
+        ok, err = self._stream.addStreamOutput_type_sampleHandlerQueue_error_(
+            self._out, SCK.SCStreamOutputTypeScreen, self._queue, None)
+        if not ok:
+            raise RuntimeError(f"addStreamOutput failed: {err}")
+        (err,) = self._wait(lambda h: self._stream.startCaptureWithCompletionHandler_(h), self.timeout_s)
+        if err is not None:
+            raise RuntimeError(f"stream did not start: {err}")
+        t0 = time.time()
+        while self._latest is None and time.time() - t0 < self.timeout_s:
+            time.sleep(0.02)                          # the first frame always arrives
+        return self
+
+    def grab_small(self) -> np.ndarray:
+        """The latest stream frame (already shrunk). Unchanged screen -> the same array as last time."""
+        with self._lock:
+            self.stats["small_reads"] += 1
+            return self._latest
+
+    def grab(self) -> Image.Image:
+        """Full-resolution screenshot of the main display, in process."""
+        import Quartz
+        import ScreenCaptureKit as SCK
+        t0, c0 = time.perf_counter(), time.process_time()
+        img, err = self._wait(lambda h: SCK.SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(
+            self._filter, self._full_cfg, h), self.timeout_s)
+        if img is None:
+            raise RuntimeError(f"screenshot failed: {err}")
+        w, h, bpr = Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img), Quartz.CGImageGetBytesPerRow(img)
+        data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
+        bgra = np.frombuffer(data, np.uint8)[:h * bpr].reshape(h, bpr)[:, :w * 4].reshape(h, w, 4)
+        out = Image.fromarray(bgra[:, :, 2::-1].copy())     # 32-bit little-endian, alpha first = BGRA
+        dt = time.perf_counter() - t0
+        s = self.stats
+        s["n"] += 1
+        s["total_s"] += dt
+        s["max_s"] = max(s["max_s"], dt)
+        s["cpu_s"] += time.process_time() - c0          # process-wide while the call ran (an upper bound)
+        return out
+
+    def cleanup(self):
+        if self._stream is not None:
+            try:
+                self._wait(lambda h: self._stream.stopCaptureWithCompletionHandler_(h), self.timeout_s)
+            except TimeoutError:
+                pass
+            self._stream = None
+
+
+def open_capture(method: str = "stream"):
+    """The app's screen source: (capturer, grab_small or None). "stream" = ScreenCaptureKit (§8.6, ~5x less
+    CPU than a `screencapture` process per poll); falls back to "screencapture" if the stream can't start."""
+    if method == "stream":
+        try:
+            cap = StreamCapturer().start()
+            return cap, cap.grab_small
+        except Exception as e:                        # older macOS, missing bindings, permission quirks
+            print(f"ScreenCaptureKit unavailable ({e}); using screencapture", flush=True)
+    return Capturer(fmt="jpg"), None
+
+
 def change_mask(h: int, w: int) -> np.ndarray:
     """True where changes count. Masks the right part of the menu bar (status items, clock)."""
     m = np.ones((h, w), bool)
@@ -184,13 +345,18 @@ class ScreenWatcher(threading.Thread):
     """Polls the screen and hands settled, changed frames to `on_frame(frame_id, captured_at, image)`.
 
     `grab` and `clock`/`sleep` are injectable so the policy can be tested without a display.
+    `grab_small` (rule "cells" only): a source of already-shrunk frames, e.g. StreamCapturer's stream; the
+    change gate runs on those, and `grab` (full resolution) is called only for a frame being handed over.
     """
 
     def __init__(self, on_frame: Callable, grab: Callable[[], Image.Image],
                  clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
-                 describe: Optional[Callable[[], list]] = None, rule: str = "cells"):
+                 describe: Optional[Callable[[], list]] = None, rule: str = "cells",
+                 grab_small: Optional[Callable[[], np.ndarray]] = None):
         super().__init__(daemon=True, name="screen-watcher")
         self.on_frame, self.grab, self.clock, self.sleep = on_frame, grab, clock, sleep
+        self.grab_small = grab_small
+        assert grab_small is None or rule == "cells"
         self.describe = describe              # diagnostics: front apps when a frame is sent
         assert rule in ("cells", "mvp")
         self.rule = rule                      # "cells" (default) or "mvp" (any changed pixel)
@@ -225,14 +391,20 @@ class ScreenWatcher(threading.Thread):
         send when enough changed and it has been quiet for a while, on a structural change after a
         short settle, after the staleness cap, or at once on the talk key."""
         t = self.clock()
-        img = self.grab()
-        small = shrink(img)
+        if self.grab_small is not None:
+            img, small = None, self.grab_small()      # full frame only if this poll hands one over
+        else:
+            img = self.grab()
+            small = shrink(img)
+
+        def full():
+            return img if img is not None else self.grab()
         self.cstats["polls"] += 1
         grid = (small.shape[0] // CELL_PX, small.shape[1] // CELL_PX)
         if self.cmask is None or self.cmask.shape != grid:
             self.cmask = cell_mask(*grid)
         if self.last_sent_small is None or self.last_sent_small.shape != small.shape:
-            self._send(img, None, t, reason="first", small=small)
+            self._send(full(), None, t, reason="first", small=small)
             state.clear()
             state["prev_small"] = small
             return IDLE_POLL_S
@@ -249,7 +421,7 @@ class ScreenWatcher(threading.Thread):
         ch_ref = cell_changes(small, self.last_sent_small) & self.cmask
         if state.pop("force", False):                        # talk key: any change at all, now
             if ch_ref.any():
-                self._send(img, None, t, reason="talk_key",
+                self._send(full(), None, t, reason="talk_key",
                            waited=t - state["first"] if state.get("first") else 0.0, small=small)
             state.pop("first", None)
             return IDLE_POLL_S
@@ -272,7 +444,7 @@ class ScreenWatcher(threading.Thread):
         elif t - state["first"] >= STALE_CAP_S:
             reason = "stale_cap"
         if reason:
-            self._send(img, None, t, reason=reason, waited=t - state["first"], small=small)
+            self._send(full(), None, t, reason=reason, waited=t - state["first"], small=small)
             for k in ("first", "last_change", "structural"):
                 state.pop(k, None)
             return IDLE_POLL_S

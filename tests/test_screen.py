@@ -219,3 +219,37 @@ def test_window_summary_marks_coverage_and_skips_strips():
     assert s["apps"] == ["Terminal", "Google Chrome", "Slack"]
     assert s["line"] == ("Open windows, front to back: Terminal; Google Chrome (partly covered); "
                          "Slack (hidden behind others).")
+
+
+def test_stream_path_decides_like_the_grab_path():
+    """ScreenWatcher(grab_small=...) (StreamCapturer) must hand over the same frames at the same times as
+    grab+shrink, and take a full-resolution grab only for frames it hands over."""
+    import numpy as np
+    import screen as scr
+    from PIL import Image
+    base = _frame()
+    para = _frame([(400 + 30 * i, 100, 20, 1200) for i in range(4)])
+    other = np.zeros_like(base)
+    word = _frame([(500, 300, 20, 60)])
+    seq = lambda t: 0 if t < 1002 else 1 if t < 1008 else 2 if t < 1015 else 3   # noqa: E731
+
+    def run(stream):
+        clock, sent, full_grabs, i = _Clock(), [], [0], {"i": 0}
+
+        def grab():
+            full_grabs[0] += 1
+            return Image.fromarray([base, para, other, word][i["i"]])
+        small = (lambda: scr.shrink(Image.fromarray([base, para, other, word][i["i"]]))) if stream else None
+        w = scr.ScreenWatcher(on_frame=lambda fid, t, img: sent.append((round(t, 1), w.handed[-1]["reason"], img.size)),
+                              grab=grab, clock=clock, sleep=lambda s: None, grab_small=small)
+        st = {}
+        while clock.t < 1050:
+            i["i"] = seq(clock.t)
+            clock.t += w.step(st)
+        return sent, full_grabs[0], w.cstats["polls"]
+
+    a, grabs_a, polls_a = run(False)
+    b, grabs_b, polls_b = run(True)
+    assert a == b
+    assert [r for _, r, _ in a] == ["first", "settled", "structural", "structural"]   # black -> word is a switch too
+    assert grabs_a == polls_a and grabs_b == len(b)

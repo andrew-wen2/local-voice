@@ -7,14 +7,21 @@ The hour is kept outside the model and searched per question; only a slice goes 
   index    an exact-word index (BM25) over blocks and over whole pages.
   retrieve rank pages (or blocks) for a question and fill a token budget.
   check    "does the thing the question names appear anywhere in memory?" If a content word of the
-           question was never on screen, answer "I didn't see that" instead of guessing.
+           question was never on screen, answer "I didn't see that" instead of guessing. Tuned on the
+           synthetic dev sessions and weak on real near-miss questions (ARCHITECTURE.md §12.9): kept as an
+           arm to compare against, off by default; refusing is the model's job.
 
-No model here: word matching only. Embeddings are a later arm.
+No model here: word matching only (BM25, Snowball English stemmer). Embeddings are a later arm.
 """
 import math
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
+
+import snowballstemmer
+
+SECTION_TOKENS = 400     # best section per page: about two screens of OCR text (160-180 tokens a screen, §12.9)
 
 # General English function words. Kept generic on purpose: the check must not be tuned to the benchmark's
 # phrasing (see eval/recall/retrieval.py for the dev / held-out split).
@@ -31,20 +38,14 @@ say said says tell told show shown see saw seen look looking looked
 _WORD = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
 
 
+_STEMMER = snowballstemmer.stemmer("english")
+
+
+@lru_cache(maxsize=200_000)
 def stem(w: str) -> str:
-    """Crude suffix stripping, applied the same way to memory and questions."""
-    w = re.sub(r"'s$", "", w)
-    if len(w) > 4 and w.endswith("ies"):
-        return w[:-3] + "y"
-    if len(w) > 5 and w.endswith("ing"):
-        return w[:-3]
-    if len(w) > 4 and w.endswith("ed"):
-        return w[:-2]
-    if len(w) > 3 and w.endswith("es") and w[-3] in "sxz":
-        return w[:-2]
-    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
-        return w[:-1]
-    return w
+    """Snowball English (Porter2), applied the same way to memory and questions. Replaced a hand-written
+    suffix stripper written after reading the benchmark's questions (§12.9)."""
+    return _STEMMER.stemWord(re.sub(r"'s$", "", w))
 
 
 def terms(text: str) -> list[str]:
@@ -191,11 +192,54 @@ class Memory:
         order = sorted(range(len(sc)), key=lambda i: -sc[i])
         return [(ix["pages"][ix["blocks"][i][0]], ix["blocks"][i][1], sc[i]) for i in order if sc[i] > 0]
 
+    def block_scores(self, question: str) -> dict[tuple[str, int], float]:
+        """BM25 score of every block for this question, keyed by (page url, block index in the page)."""
+        ix = self.index()
+        sc = ix["block_bm25"].scores(terms(question))
+        out, seen = {}, {}
+        for (pi, _), s in zip(ix["blocks"], sc):
+            url = ix["pages"][pi].url
+            j = seen.get(url, 0)
+            seen[url] = j + 1
+            out[(url, j)] = s
+        return out
+
+    def best_section(self, page: Page, question: str, count, max_tokens: int = SECTION_TOKENS) -> list[str]:
+        """The run of consecutive blocks of at most max_tokens with the highest summed BM25 score; the whole
+        page if it fits. Ties go to the earliest run (the top of the page)."""
+        cost = [count(b + "\n") for b in page.blocks]
+        if sum(cost) <= max_tokens:
+            return list(page.blocks)
+        sc = self._scores_cache(question)
+        s = [sc.get((page.url, j), 0.0) for j in range(len(page.blocks))]
+        best, best_i, best_j = -1.0, 0, 0
+        j, tok, tot = 0, 0, 0.0
+        for i in range(len(page.blocks)):              # two pointers: window [i, j)
+            while j < len(page.blocks) and tok + cost[j] <= max_tokens:
+                tok += cost[j]
+                tot += s[j]
+                j += 1
+            if tot > best:
+                best, best_i, best_j = tot, i, j
+            if j == i:                                 # a single block longer than max_tokens
+                j += 1
+                continue
+            tok -= cost[i]
+            tot -= s[i]
+        return page.blocks[best_i:best_j]
+
+    def _scores_cache(self, question: str):
+        ix = self.index()
+        if ix.get("_q") != question:
+            ix["_q"], ix["_qs"] = question, self.block_scores(question)
+        return ix["_qs"]
+
     def retrieve(self, question: str, budget: int, count, mode: str = "pages", **kw) -> list[tuple[Page, list[str]]]:
         """Fill `budget` tokens (count: str -> int). Returns [(page, blocks included)] in rank order.
 
-        pages   whole pages in rank order, one result per page; the page that doesn't fit is cut at a block.
-        chunks  plain RAG: top blocks by BM25 regardless of page, grouped under their page for display.
+        pages     whole pages in rank order, one result per page; the page that doesn't fit is cut at a block.
+        sections  pages in rank order, one result per page, each page's best section (best_section) only.
+        chunks    plain RAG: top blocks by BM25 regardless of page, grouped under their page for display.
         """
         out: dict[str, tuple[Page, list[str]]] = {}
         used = 0
@@ -212,6 +256,19 @@ class Memory:
                         break
                     kept.append(b)
                     used += c
+                out[p.url] = (p, kept)
+                if used >= budget:
+                    break
+        elif mode == "sections":
+            q = question
+            for p, _ in self.rank_pages(question, **kw):
+                head = count(p.text([]))
+                if used + head > budget:
+                    break
+                kept = self.best_section(p, q, count, min(SECTION_TOKENS, budget - used - head))
+                if not kept:
+                    break
+                used += head + sum(count(b + "\n") for b in kept)
                 out[p.url] = (p, kept)
                 if used >= budget:
                     break

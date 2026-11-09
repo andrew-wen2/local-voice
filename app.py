@@ -224,16 +224,18 @@ def live(args):
               "Turn it on in System Settings > Privacy & Security > Screen & System Audio Recording,\n"
               "then restart the terminal. (Without it, macOS returns only the wallpaper.)")
         sys.exit(2)
-    cap = scr.Capturer(fmt="jpg")
+    cap, grab_small = scr.open_capture(getattr(args, "capture", "stream"))
     asst = Assistant(budget=args.budget, asr=args.asr, **worker_opts(args))
     speaker = Speaker().start()
     mic = Mic().start()
     print("starting (first launch can take a few minutes)...", flush=True)
     first = cap.grab()
     asst.start(warm_image=first, first_frame=(0, time.time(), first))
-    watcher = scr.ScreenWatcher(on_frame=asst.worker.submit_frame, grab=cap.grab, describe=scr.window_summary)
+    watcher = scr.ScreenWatcher(on_frame=asst.worker.submit_frame, grab=cap.grab, describe=scr.window_summary,
+                                grab_small=grab_small)
     watcher.last_sent = np.asarray(first)
-    watcher.last_sent_small = scr.shrink(first)
+    # the gate compares like with like: the stream's own small frame, or our shrink of a full grab
+    watcher.last_sent_small = grab_small() if grab_small else scr.shrink(first)
     watcher.start()
     log = LOGS / f"turns-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     import queue
@@ -583,6 +585,8 @@ def add_worker_args(ap):
                     help="print the transcript and answer in the terminal (the assistant can then read them on screen)")
     ap.add_argument("--hotkey", choices=["right_option", "right_command", "right_control", "fn", "none"],
                     default="right_option", help="hold this key in any app to talk (needs Input Monitoring permission)")
+    ap.add_argument("--capture", choices=["stream", "screencapture"], default="stream",
+                    help="screen source: ScreenCaptureKit stream (default) or a screencapture process per poll")
     ap.add_argument("--history", choices=["on", "off", "auto"], default="auto",
                     help="conversation history in the context: auto = on live, off in replays (independent test questions)")
 
