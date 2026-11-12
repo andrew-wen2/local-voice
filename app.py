@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """app.py — offline, screen-aware voice assistant (MVP, naive baseline).
 
-  python app.py                      live: hold Right Option in any app to talk (release = stop, press while it speaks = interrupt);
+  python app.py                      live, with memory of past screens (recall mode, ARCHITECTURE.md §5.9): hold Right
+                                     Option in any app to talk (release = stop, press while it speaks = interrupt);
                                      Enter in the terminal also works (talk / stop / interrupt), q = quit
+  python app.py --screen-only        the previous app: the current screen only, no memory of past screens
   python app.py --replay reading     replay a test set through the timing harness (reading|reasoning|voice|contention)
   python app.py --replay voice --sandbox-profile eval/offline.sb   (used by the offline test)
 
@@ -35,7 +37,7 @@ import numpy as np  # noqa: E402
 import screen as scr  # noqa: E402
 from asr import AsrError, make_asr  # noqa: E402
 from audio_io import Mic, Speaker, near_silent, rms_dbfs  # noqa: E402
-from engine import AneTts, AnswerJob, GemmaAdapter, GpuWorker, make_tts  # noqa: E402
+from engine import RECALL_INSTRUCTION, AneTts, AnswerJob, GemmaAdapter, GpuWorker, make_tts  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
@@ -230,28 +232,9 @@ class Assistant:
 
 # ---------------------------------------------------------------- live mode
 
-def live(args):
-    if not scr.has_screen_permission():
-        print("Screen Recording permission is off for this terminal app.\n"
-              "Turn it on in System Settings > Privacy & Security > Screen & System Audio Recording,\n"
-              "then restart the terminal. (Without it, macOS returns only the wallpaper.)")
-        sys.exit(2)
-    cap, grab_small = scr.open_capture(getattr(args, "capture", "stream"))
-    asst = Assistant(budget=args.budget, asr=args.asr, tts=getattr(args, "tts", "ane"),
-                     vision_bits=getattr(args, "vision_bits", 16), swap_weights=getattr(args, "swap_weights", "on") == "on",
-                     **worker_opts(args))
-    speaker = Speaker().start()
-    mic = Mic().start()
-    print("starting (first launch can take a few minutes)...", flush=True)
-    first = cap.grab()
-    asst.start(warm_image=first, first_frame=(0, time.time(), first))
-    watcher = scr.ScreenWatcher(on_frame=asst.worker.submit_frame, grab=cap.grab, describe=scr.window_summary,
-                                grab_small=grab_small)
-    watcher.last_sent = np.asarray(first)
-    # the gate compares like with like: the stream's own small frame, or our shrink of a full grab
-    watcher.last_sent_small = grab_small() if grab_small else scr.shrink(first)
-    watcher.start()
-    log = LOGS / f"turns-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+def talk_events(args):
+    """Talk-key events: "down" / "up" from the global hotkey helper, "enter" / "quit" from the terminal.
+    Returns (queue, hotkey process or None, status line)."""
     import queue
     events: "queue.Queue[str]" = queue.Queue()
 
@@ -277,6 +260,32 @@ def live(args):
         else:
             hotkey_msg = f"global hotkey unavailable: {first_line or 'no output'}"
             hotkey_proc = None
+    return events, hotkey_proc, hotkey_msg
+
+
+def live(args):
+    if not scr.has_screen_permission():
+        print("Screen Recording permission is off for this terminal app.\n"
+              "Turn it on in System Settings > Privacy & Security > Screen & System Audio Recording,\n"
+              "then restart the terminal. (Without it, macOS returns only the wallpaper.)")
+        sys.exit(2)
+    cap, grab_small = scr.open_capture(getattr(args, "capture", "stream"))
+    asst = Assistant(budget=args.budget, asr=args.asr, tts=getattr(args, "tts", "ane"),
+                     vision_bits=getattr(args, "vision_bits", 16), swap_weights=getattr(args, "swap_weights", "on") == "on",
+                     **worker_opts(args))
+    speaker = Speaker().start()
+    mic = Mic().start()
+    print("starting (first launch can take a few minutes)...", flush=True)
+    first = cap.grab()
+    asst.start(warm_image=first, first_frame=(0, time.time(), first))
+    watcher = scr.ScreenWatcher(on_frame=asst.worker.submit_frame, grab=cap.grab, describe=scr.window_summary,
+                                grab_small=grab_small)
+    watcher.last_sent = np.asarray(first)
+    # the gate compares like with like: the stream's own small frame, or our shrink of a full grab
+    watcher.last_sent_small = grab_small() if grab_small else scr.shrink(first)
+    watcher.start()
+    log = LOGS / f"turns-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    events, hotkey_proc, hotkey_msg = talk_events(args)
     print(f"ready in {asst.startup['total_s']} s  {asst.startup}\n"
           f"Enter = talk / stop / interrupt, q = quit;  {hotkey_msg}", flush=True)
 
@@ -375,6 +384,225 @@ def live(args):
         hotkey_proc.terminate()
     watcher.stop()
     asst.stop()
+    speaker.stop()
+    mic.stop()
+    cap.cleanup()
+
+
+# ---------------------------------------------------------------- live mode with recall (ARCHITECTURE.md §5.9)
+
+def live_recall(args):
+    """Live mode with memory of past screens: the frames the app reads are OCR'd into pages and visits (recall.py),
+    and the turn scheduler (scheduler.py, recall_worker.py) runs the GPU. While the key is held, partial transcripts
+    drive retrieval, exact page upgrades and the question prefill; release prefills what is left and answers."""
+    from asr import Partials
+    from audio_io import SILENCE_S
+    from recall import Ocr, Store, windows
+    from recall_backend import TurnIO
+    from recall_worker import RecallWorker, ScreenEncoder
+    from screen_store import ScreenStore
+    if not scr.has_screen_permission():
+        print("Screen Recording permission is off for this terminal app (System Settings > Privacy & Security > "
+              "Screen & System Audio Recording); restart the terminal after turning it on.")
+        sys.exit(2)
+    LOGS.mkdir(exist_ok=True)
+    t_all = time.perf_counter()
+    cap, grab_small = scr.open_capture(getattr(args, "capture", "stream"))
+    asr = make_asr(args.asr, log_dir=LOGS)
+    asr.start(sandbox_profile=None)
+    asr.transcribe((QDIR / "v01.wav").read_bytes())
+    tts = make_tts(getattr(args, "tts", "ane"), log_dir=LOGS)
+    store = Store()
+    screens = ScreenStore()                          # kept screens: owner-only folder, deleted on quit (§5.12)
+    o = worker_opts(args)
+    adapter = GemmaAdapter(vision_bits=getattr(args, "vision_bits", 16),
+                           swap_weights=getattr(args, "swap_weights", "on") == "on", instruction=RECALL_INSTRUCTION)
+    worker = RecallWorker(adapter, tts, store, budget=args.budget, freshness="C" if o["freshness"] == "C" else "B",
+                          first_chunk=o["first_chunk"], trim_silence=o["trim_silence"], mlx_cache_gb=o["mlx_cache_gb"],
+                          screen_store=screens)
+    print("starting (first launch can take a few minutes)...", flush=True)
+    worker.start()
+    worker.ready.wait()
+    if worker.error:
+        raise worker.error
+    ane = None
+    try:                                             # kept screens are encoded on the Neural Engine when it can
+        from ane_vision import OUT, AneProcess
+        ane = AneProcess(OUT).load()
+    except Exception as e:
+        print(f"(Neural Engine encoder unavailable, kept screens are encoded on the GPU: {e!r})", flush=True)
+    encoder = ScreenEncoder(adapter, screens, quiet=lambda: not worker.turn_active, on_ready=worker.key_frame, ane=ane)
+    encoder.start()
+    ocr = Ocr(store, quiet=lambda: not worker.turn_active, on_visit_end=worker.visit_ended, t0=store.start.timestamp(),
+              on_keep=encoder.submit, on_unit_text=screens.add_lines)
+    ocr.start()
+    speaker, mic = Speaker().start(), Mic().start()
+    before: dict = {}
+
+    def grab():
+        before["windows"] = windows()               # the window list just before the screenshot (§12.9)
+        return cap.grab()
+
+    def on_frame(frame_id, t, img, note=None):
+        worker.frame(frame_id, img)
+        ocr.submit(t, img, before.get("windows"), windows(), fid=frame_id)
+
+    first = grab()
+    on_frame(0, time.time(), first)
+    if not worker.wait_ready(300):
+        raise RuntimeError("first screen read or prefix did not finish")
+    watcher = scr.ScreenWatcher(on_frame=on_frame, grab=grab, grab_small=grab_small)
+    watcher.last_sent = np.asarray(first)
+    watcher.last_sent_small = grab_small() if grab_small else scr.shrink(first)
+    watcher.start()
+    log = LOGS / f"turns-recall-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    events, hotkey_proc, hotkey_msg = talk_events(args)
+    print(f"ready in {round(time.perf_counter() - t_all, 1)} s  {worker.startup}\n"
+          f"Enter = talk / stop / interrupt, q = quit;  {hotkey_msg}", flush=True)
+
+    state, turn, seq = "idle", {}, [0]
+
+    def watch_voice(stop):
+        """mic_silent / speech events while the key is held (scheduling only, §5.9)."""
+        silent = False
+        while not stop.wait(0.05):
+            s = mic.silent_for()
+            if s is None:
+                continue
+            if not silent and s >= SILENCE_S:
+                silent = True
+                worker.mic_silent()
+            elif silent and s < SILENCE_S:
+                silent = False
+                worker.speech()
+
+    def start_recording(source):
+        worker.key_down()
+        watcher.capture_now()
+        mic.begin()
+        turn.clear()
+        seq[0] += 1
+        turn.update(source=source, t_press=time.perf_counter(), stop=threading.Event(), seq=seq[0])
+        turn["partials"] = Partials(asr, mic.audio, mic.voiced_until, worker.partial)
+        turn["partials"].start()
+        threading.Thread(target=watch_voice, args=(turn["stop"],), daemon=True).start()
+        print("listening..." + (" (release to stop)" if source == "hotkey" else " (Enter to stop)"), flush=True)
+
+    def stop_and_answer():
+        audio = mic.end()
+        t_eos = time.perf_counter()
+        turn["stop"].set()
+        marks: dict = {}
+        first_audio: dict = {}
+
+        def mark(n):
+            marks.setdefault(n, time.perf_counter())
+
+        def emit(samples, sr):
+            if "t" not in first_audio:
+                from harness.harness import first_audible
+                i = first_audible(samples)
+                if i is not None:
+                    first_audio["t"] = time.perf_counter() + i / sr
+            speaker.play(samples, sr)
+
+        io = TurnIO(emit_audio=emit, mark=mark)
+        turn["io"] = io
+        my = turn["seq"]
+        worker.key_up(io)
+
+        def run():
+            row = {"mode": "live-recall", "near_silent": near_silent(audio), "input_dbfs": round(rms_dbfs(audio), 1)}
+            p = turn["partials"]
+            p.finish()
+            text = p.final_text()
+            row["final_from_partial"] = text is not None
+            if text is None and not row["near_silent"]:
+                try:
+                    text = asr.transcribe(audio)["text"]
+                except AsrError as e:
+                    row["error"] = str(e)
+            mark("asr_done")
+            row.update(transcript=text, partials=p.stats["partials"], partial_calls=p.stats["calls"])
+            if not text:
+                worker.cancel_turn()
+                row.setdefault("error", "empty transcript" + (" (mic muted or no permission?)" if row["near_silent"] else ""))
+            else:
+                io.question = text
+                worker.final(text)
+            io.done.wait(120)
+            row.update(io.result)
+            speaker.wait_done(60)
+            if seq[0] == my:                    # not replaced by a newer question (barge-in)
+                worker.turn_active = False
+                ocr.poke()
+                encoder.poke()
+            ms = {k: round((v - t_eos) * 1000, 1) for k, v in marks.items()}
+            row.update(t_eos_wall=time.time(), marks_ms=ms,
+                       first_audio_ms=round((first_audio["t"] - t_eos) * 1000, 1) if "t" in first_audio else None,
+                       output_device_latency_ms=speaker.device_latency_ms(), store_pages=len(store.m.pages),
+                       store_visits=len(store.visits), ocr_frames=ocr.stats["frames"], kept_screens=len(screens.ids()),
+                       screens_pending=len(screens.pending), encoder=dict(encoder.stats))
+            if getattr(args, "show_text", False):
+                print(f"  you: {row.get('transcript')!r}\n  it:  {row.get('answer') or row.get('error')!r}", flush=True)
+            status = "error: " + row["error"] if row.get("error") else "answered"
+            print(f"  {status}, first audio {row['first_audio_ms']} ms after you stopped", flush=True)
+            with log.open("a") as f:
+                f.write(json.dumps(row, default=str) + "\n")
+            os.chmod(log, 0o600)
+            if seq[0] == my:
+                turn["state"] = "idle"
+
+        turn["state"] = "answering"
+        turn["thread"] = threading.Thread(target=run, daemon=True)
+        turn["thread"].start()
+
+    def interrupt():
+        worker.interrupt()
+        dropped = speaker.clear()
+        print(f"  interrupted ({dropped / speaker.sr:.1f} s of audio dropped)", flush=True)
+
+    while True:
+        ev = events.get()
+        if ev == "quit":
+            break
+        if state == "answering" and turn.get("state") == "idle":
+            state = "idle"
+        if ev in ("enter", "down"):
+            if state == "recording":
+                if ev == "enter":
+                    stop_and_answer()
+                    state = "answering"
+                continue
+            if state == "answering":                        # barge in: the scheduler drops the old answer
+                interrupt()
+            start_recording("hotkey" if ev == "down" else "enter")
+            state = "recording"
+        elif ev == "up" and state == "recording" and turn.get("source") == "hotkey":
+            if time.perf_counter() - turn["t_press"] < 0.25:  # a tap, not a question
+                mic.end()
+                turn["stop"].set()
+                turn["partials"].finish()
+                worker.cancel_turn()
+                worker.turn_active = False
+                state = "idle"
+                print("  (too short, ignored)", flush=True)
+                continue
+            stop_and_answer()
+            state = "answering"
+    if hotkey_proc:
+        hotkey_proc.terminate()
+    watcher.stop()
+    ocr.stop()
+    encoder.stop()
+    worker.stop()
+    worker.join(10)
+    if ane is not None:
+        ane.close()
+    screens.close()                                  # kept screens deleted on quit
+    if hasattr(tts, "stop"):
+        tts.stop()
+    asr.stop()
     speaker.stop()
     mic.stop()
     cap.cleanup()
@@ -629,11 +857,15 @@ def main():
     ap.add_argument("--replay", choices=["reading", "reasoning", "voice", "contention"])
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--sandbox-profile", default="")
+    ap.add_argument("--screen-only", action="store_true",
+                    help="the previous app: answer from the current screen only, no memory of past screens")
     args = ap.parse_args()
     if args.replay:
-        replay(args)
-    else:
+        replay(args)                     # the timing harness still replays the current-screen app (GpuWorker)
+    elif args.screen_only:
         live(args)
+    else:
+        live_recall(args)                # the shipped app: recall mode (ARCHITECTURE.md §5.9)
 
 
 if __name__ == "__main__":

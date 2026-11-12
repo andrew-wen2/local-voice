@@ -17,6 +17,10 @@ from typing import Optional
 import numpy as np
 
 SILENT_DBFS = -50.0
+# Voice activity while the key is held (recall mode, ARCHITECTURE.md §5.9). Provisional, and only used for
+# scheduling: a block is voiced above VOICE_DBFS; the mic counts as silent after SILENCE_S without a voiced block.
+VOICE_DBFS = -45.0
+SILENCE_S = 0.3
 
 
 def rms_dbfs(x: np.ndarray) -> float:
@@ -115,14 +119,18 @@ class Speaker:
 
 
 class Mic:
-    """Records while open. `begin()` on key press, `end()` on release returns the samples."""
+    """Records while open. `begin()` on key press, `end()` on release returns the samples.
+    While recording it also tracks voice activity per 20 ms block (`audio()`, `voiced_until()`, `silent_for()`)."""
 
-    def __init__(self, sample_rate: int = 16000):
+    def __init__(self, sample_rate: int = 16000, voice_dbfs: float = VOICE_DBFS):
         self.sr = sample_rate
         self.lock = threading.Lock()
         self.parts: list[np.ndarray] = []
         self.recording = False
         self.stream = None
+        self.voice_dbfs = voice_dbfs
+        self.n = 0                       # samples recorded this turn
+        self.last_voice = -1             # sample index where the last voiced block ended (-1: none yet)
 
     def start(self):
         import sounddevice as sd
@@ -133,13 +141,35 @@ class Mic:
 
     def _cb(self, indata, frames, time_info, status):
         if self.recording:
-            with self.lock:
-                self.parts.append(indata[:, 0].copy())
+            self.feed(indata[:, 0].copy())
+
+    def feed(self, x: np.ndarray):
+        """One block of samples (the stream callback, or a replay)."""
+        with self.lock:
+            self.parts.append(x)
+            self.n += len(x)
+            if rms_dbfs(x) > self.voice_dbfs:
+                self.last_voice = self.n
 
     def begin(self):
         with self.lock:
             self.parts = []
+            self.n, self.last_voice = 0, -1
             self.recording = True
+
+    def audio(self) -> np.ndarray:
+        """The samples so far, without ending the turn."""
+        with self.lock:
+            return np.concatenate(self.parts) if self.parts else np.zeros(0, np.float32)
+
+    def voiced_until(self) -> int:
+        """Sample index where the last voiced block ended, or -1."""
+        return self.last_voice
+
+    def silent_for(self) -> Optional[float]:
+        """Seconds since the last voiced block, or None before any voice this turn."""
+        with self.lock:
+            return None if self.last_voice < 0 else (self.n - self.last_voice) / self.sr
 
     def end(self) -> np.ndarray:
         with self.lock:

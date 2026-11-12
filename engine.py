@@ -53,6 +53,15 @@ SPOKEN_INSTRUCTION = (
     "Answer in one to three short spoken sentences. Write numbers as digits. "
     "No lists, no markdown, no code blocks."
 )
+# Recall mode (ARCHITECTURE.md §5.12): earlier screens and pages sit above the current screen, so "the image above" is
+# ambiguous; say which image is now. Same answer rules as SPOKEN_INSTRUCTION.
+RECALL_INSTRUCTION = (            # wording v1 of §5.24 (Andrew, 2026-11-12: no screen talk unless asked, no images, short)
+    "You are a helpful voice assistant. The image just above is the user's current screen, what is on screen right "
+    "now; earlier screens and pages above it are no longer on screen. Use them only when the question is about what is "
+    "or was on the user's screen; answer any other question directly, without bringing up the screen. Never mention "
+    "images, screenshots or what you were given; just answer. Use one short spoken sentence when that is enough, and "
+    "never more than three. Write numbers as digits. No lists, no markdown, no code blocks."
+)
 MVP_INSTRUCTION = (            # until 2026-11-06: read as screen-only ("What is 3 plus 3?" was refused)
     "You are a voice assistant that can see the user's screen in the image above. "
     "Answer in one to three short spoken sentences. No lists, no markdown, no code blocks."

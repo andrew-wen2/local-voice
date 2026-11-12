@@ -235,6 +235,60 @@ class ParakeetServer:
         return {"text": raw.get("text", "").strip(), "seconds": time.perf_counter() - t0, "raw": raw}
 
 
+class Partials(threading.Thread):
+    """Partial transcripts while the talk key is held (recall mode, ARCHITECTURE.md §5.9). Parakeet has no streaming
+    API here, so the audio so far is transcribed again, every `every_s` once `min_new_s` of new audio has arrived
+    (~40 ms for a 3 s question on the Neural Engine, which nothing else uses during a turn, §6.1).
+
+    get_audio() -> samples so far; voiced_until() -> sample index where the last voiced block ended;
+    on_partial(text) for each changed transcript. `final_text()` after the key is released: the last partial
+    when it covered every voiced sample (so the rest of the recording is silence), else None and the caller
+    transcribes the whole recording. Settings are provisional (set before measuring)."""
+
+    def __init__(self, asr, get_audio, voiced_until, on_partial, every_s: float = 0.3, min_new_s: float = 0.25,
+                 min_audio_s: float = 0.5, sr: int = 16000):
+        super().__init__(daemon=True, name="asr-partials")
+        self.asr, self.get_audio, self.voiced_until, self.on_partial = asr, get_audio, voiced_until, on_partial
+        self.every_s, self.min_new, self.min_audio, self.sr = every_s, int(min_new_s * sr), int(min_audio_s * sr), sr
+        self.stop_ev = threading.Event()
+        self.last: Optional[tuple[int, str]] = None     # (samples covered, text)
+        self.stats = {"partials": 0, "calls": 0, "asr_s": 0.0, "errors": 0}
+
+    def step(self) -> bool:
+        """Transcribe the audio so far if enough is new. Returns True if it ran."""
+        x = self.get_audio()
+        covered = self.last[0] if self.last else 0
+        if len(x) < self.min_audio or len(x) - covered < self.min_new or self.voiced_until() < 0:
+            return False
+        try:
+            r = self.asr.transcribe(x)
+        except AsrError:
+            self.stats["errors"] += 1
+            return False
+        self.stats["calls"] += 1
+        self.stats["asr_s"] += r.get("seconds", 0.0)
+        prev = self.last[1] if self.last else None
+        self.last = (len(x), r["text"])
+        if r["text"] and r["text"] != prev:
+            self.stats["partials"] += 1
+            self.on_partial(r["text"])
+        return True
+
+    def run(self):
+        while not self.stop_ev.wait(self.every_s):
+            self.step()
+
+    def finish(self, timeout: float = 2.0):
+        self.stop_ev.set()
+        self.join(timeout)
+
+    def final_text(self) -> Optional[str]:
+        if self.last is None or not self.last[1]:
+            return None
+        v = self.voiced_until()
+        return self.last[1] if 0 <= v <= self.last[0] else None
+
+
 def make_asr(kind: str = "parakeet", log_dir: Optional[Path] = None):
     """kind: 'parakeet' (default) or 'whisper'."""
     if kind == "whisper":
