@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
-from memory import Memory
+from memory import Memory, Page
 
 # ---------------------------------------------------------------- page key and text (§12.9)
 
@@ -256,6 +256,7 @@ class Store:
         self.n_visits: dict[str, int] = {}
         self.version: dict[str, int] = {}                  # key -> number of finished visits
         self.cur: Optional[_Visit] = None
+        self.views: dict[str, Page] = {}                   # "view:<fid>" -> a kept screen's view text (§5.25)
         self.lock = threading.RLock()
 
     def at(self, t: float) -> datetime:
@@ -306,15 +307,48 @@ class Store:
         with self.lock:
             return timeline_text(self.visits, self.at, lambda k: self.m.pages[k].title)
 
+    def page(self, key: str) -> Optional[Page]:
+        """A page of the store, or a kept screen's view ("view:<fid>")."""
+        with self.lock:
+            return self.views.get(key) or self.m.pages.get(key)
+
     def head(self, key: str) -> str:
         with self.lock:
-            return page_head(self.m.pages[key], self.at, self.n_visits.get(key, 1))
+            return page_head(self.page(key), self.at, self.n_visits.get(key, 1))
 
     def page_text(self, key: str, n_lines: Optional[int] = None) -> str:
         """A page's slot text as it goes into the context: "\\n\\n" + time header + page (first n_lines lines)."""
         with self.lock:
-            p = self.m.pages[key]
+            p = self.page(key)
             return "\n\n" + self.head(key) + p.text(p.blocks if n_lines is None else p.blocks[:n_lines])
+
+    def set_view(self, fid: int, screen) -> str:
+        """§5.25 (Andrew, 2026-11-12): a kept screen's view text as a memory slot: the page-area lines of the kept frame
+        and the frames it stands in for, headed like its page (time, title, address). Its version bumps when the text
+        grows (dropped frames keep arriving). Returns its key "view:<fid>"."""
+        vk = f"view:{fid}"
+        with self.lock:
+            lines = list(screen.lines)
+            old = self.views.get(vk)
+            if old is None or old.blocks != lines:
+                orig = self.m.pages.get(screen.key)
+                self.views[vk] = Page(url=screen.key, title=screen.title, blocks=lines, first_s=screen.t,
+                                      last_s=screen.t, dwell_s=orig.dwell_s if orig else 0.0, screens=1)
+                self.version[vk] = self.version.get(vk, 0) + 1
+                self.n_visits[vk] = self.n_visits.get(screen.key, 1)
+            return vk
+
+    def view_slot(self, vk: str, budget: int, count) -> tuple:
+        """(key, version, lines shown): the view's lines from the top, as many as fit in `budget` tokens (at least one)."""
+        with self.lock:
+            p, n = self.views[vk], 0
+            while n < len(p.blocks) and count(self.page_text(vk, n + 1)) <= budget:
+                n += 1
+            return (vk, self.version[vk], max(n, 1))
+
+    def drop_view(self, fid: int):
+        with self.lock:
+            self.views.pop(f"view:{fid}", None)
 
     def excerpt(self, question: str) -> str:
         with self.lock:

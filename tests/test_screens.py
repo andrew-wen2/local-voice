@@ -201,3 +201,44 @@ def test_unit_text_joins_its_screen_even_before_it_is_ready():
     sc = st.text_scores("brass lamp", [1, 2])
     assert sc[1] > sc[0] and st.text_scores("8:15 train", [2, 1])[1] > 0
     st.close()
+
+
+def test_a_kept_screens_view_text_is_a_memory_slot():
+    st = Store()
+    st.add(0, "A", "Lamp shop", "brass lamp")
+    st.add(10, "B", "Notes", "todo")
+    s = screen(7, 5.0, "Lamp shop", ["brass lamp", "price 40", "in stock"])
+    s.key = "A"
+    vk = st.set_view(7, s)
+    assert vk == "view:7" and st.page(vk).url == "A" and st.version[vk] == 1
+    assert "brass lamp" in st.page_text(vk) and "Lamp shop" in st.page_text(vk)
+    assert st.set_view(7, s) == vk and st.version[vk] == 1                 # same text: same version
+    s.lines = s.lines + ["blue shade"]
+    st.set_view(7, s)
+    assert st.version[vk] == 2                                             # text grew: new version
+    key, v, n = st.view_slot(vk, 10**6, lambda t: len(t.split()))
+    assert (key, v, n) == (vk, 2, 4)
+    assert st.view_slot(vk, 1, lambda t: len(t.split()))[2] == 1           # always at least one line
+    st.drop_view(7)
+    assert st.page(vk) is None
+
+
+def test_worker_gives_the_top_screens_view_instead_of_pages():
+    st = Store()
+    st.add(0, "A", "Lamp shop", "brass lamp")
+    st.add(10, "B", "Notes", "todo")
+    ss = ScreenStore()
+    s = screen(4, 1.0, "Lamp shop", ["brass lamp"])
+    s.key = "A"
+    ss.add(s)
+    be = SimBackend(FakeClock(), T)
+    be.find_screens = lambda text: [4]
+    be.ss = ss
+    w = RecallWorker(None, None, st, backend_factory=lambda: be)
+    w.start()
+    assert w.ready.wait(5)
+    slots = w.run_on_worker(lambda: w._retrieve("brass lamp"))
+    w.stop()
+    w.join(5)
+    assert slots[:2] == ((SCREEN, 4), (OPENER,)) and len(slots) == 3 and slots[2][0] == "view:4"
+    ss.close()

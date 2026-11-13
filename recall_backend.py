@@ -301,7 +301,7 @@ class RecallBackend:
         def g():
             yield "plan_build"                          # CPU: version, parents (BM25 over the store)
             with self.store.lock:
-                p = self.store.m.pages.get(key)
+                p = self.store.page(key)                # a page, or a kept screen's view (§5.25)
                 if p is None:
                     return
                 v = self.store.version[key]
@@ -447,6 +447,9 @@ class RecallBackend:
             self.ss.add(Screen(fid, meta["t"], meta["key"], meta["title"], meta["lines"], keys, null, path,
                                size=tuple(meta["size"]), T=T))
             self.ss.expire(meta["t"])
+            self.store.set_view(fid, self.ss.screens[fid])          # §5.25: its view text, a memory slot
+            for vk in [k for k in self.store.views if int(k[5:]) not in self.ss.screens]:
+                self.store.drop_view(int(vk[5:]))
             mx.clear_cache()
         return g()
 

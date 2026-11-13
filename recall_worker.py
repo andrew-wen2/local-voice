@@ -187,6 +187,7 @@ class RecallWorker(threading.Thread):
             s.key_down(t=args[0])
         elif name == "key_frame":
             s.add_build((KEY, args[0]))
+            s.add_build((f"view:{args[0]}", 0, 0))      # its view's stored piece, once keying has registered it
         elif name == "key_up":
             self.io = self.backend.io = args[1]
             s.key_up(t=args[0])
@@ -259,12 +260,20 @@ class RecallWorker(threading.Thread):
         if text in self._found:
             return self._found[text]
         used = self._count(self.store.timeline() + "\n\n") + self._count(PAGES_HEAD + HINT)
-        pages = tuple(self.store.pick(text, self.cap, self._count, used=used))
         find = getattr(self.backend, "find_screens", None)
         if find is None:                              # backends without kept screens (tests)
-            out = pages
+            out = tuple(self.store.pick(text, self.cap, self._count, used=used))
         else:
-            out = tuple((SCREEN, f) for f in find(text)) + ((OPENER,),) + pages
+            # §5.25 (Andrew, 2026-11-12): the memory text is the top kept screen's own view text, up to the same
+            # budget; whole pages only while no screen has been kept yet.
+            fids = find(text)
+            ss = getattr(self.backend, "ss", None)
+            if fids and ss is not None and ss.ready(fids[0]):
+                vk = self.store.set_view(fids[0], ss.screens[fids[0]])
+                mem = (self.store.view_slot(vk, self.cap - used, self._count),)
+            else:
+                mem = tuple(self.store.pick(text, self.cap, self._count, used=used))
+            out = tuple((SCREEN, f) for f in fids) + ((OPENER,),) + mem
         self._found[text] = out
         return out
 
