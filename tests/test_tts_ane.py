@@ -25,7 +25,7 @@ def test_synth_returns_trimmed_audio_and_stops_cleanly():
 
 
 def test_default_tts_never_imports_the_python_kokoro_stack():
-    assert isinstance(make_tts("ane"), AneTts)
+    assert isinstance(make_tts(), AneTts)
     assert not any(m in sys.modules for m in ("mlx_audio", "misaki", "spacy"))
 
 

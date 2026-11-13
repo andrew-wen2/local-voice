@@ -53,11 +53,7 @@ from recall import HINT, PAGES_HEAD
 from screen_store import KEY_LAYERS, Screen, quantize_int8
 
 SCREEN, OPENER, KEY = "§screen", "§opener", "§key"
-SOPENER = "§sopener"
-KEPT_HEAD = "(Earlier screen from {time}, no longer on screen) {title}"       # a kept screen's label (§5.21 X5 varies it)              # screens-only memory turn (§5.15)
-SCREENS_HEAD = ("(Screens seen earlier in the last hour that may be relevant. None of them are on screen any more; use "
-                "them for questions about what was on screen before.)\n"
-                "If the answer is not in these screens or on the current screen, say you didn't see it.")
+KEPT_HEAD = "(Earlier screen from {time}, no longer on screen) {title}"       # a kept screen's label
 NULL_Q = "N/A"                    # ICR's content-free query (§12.17)
 
 K_PARENTS = 4                 # §3.11: similar4 met the bar
@@ -149,8 +145,6 @@ class RecallBackend:
                  screen_store=None, n_screens: int = 1):           # Andrew, 2026-11-11 (§5.13)
         self.a, self.store, self.tts = adapter, store, tts
         self.ss, self.n_screens = screen_store, n_screens
-        self.screens_after_pages = False                # §5.14's layout test: screens between pages and the current screen
-        self.kept_head = KEPT_HEAD                      # §5.21 X5: the eval varies the label
         self._tpl: dict = {}                            # (size, text) -> processor inputs for a blank image
         self._null: dict = {}                           # screen-turn length -> null-query vectors per layer
         self._stack = None                              # (store version, fids, {layer: (int8, scales, nulls)})
@@ -220,8 +214,6 @@ class RecallBackend:
     def page_ids(self, slot) -> tuple:
         if kind(slot) == OPENER:
             return self._ids(TURN_USER + HEAD)
-        if kind(slot) == SOPENER:
-            return self._ids(TURN_USER + SCREENS_HEAD)
         key, _, n_lines = slot
         return self._ids(self.store.page_text(key, n_lines))
 
@@ -355,13 +347,10 @@ class RecallBackend:
         return self._tpl[key]
 
     def _turn_text(self, s: Screen) -> str:
-        """Before the pages: a closed user turn. After them (screens_after_pages): it closes the turn before it and stays
-        open, so the next screen (or the current screen's piece, which starts with <turn|>) closes it."""
+        """A kept screen's turn: a closed user turn, before the pages."""
         from recall import hm
         t = self.store.at(s.t)
-        head = self.kept_head.format(time=f"{hm(t)} {t.strftime('%p')}", title=s.title) + "\n<|image|>"
-        if self.screens_after_pages:
-            return f"{TURN_END}{TURN_USER}{head}"
+        head = KEPT_HEAD.format(time=f"{hm(t)} {t.strftime('%p')}", title=s.title) + "\n<|image|>"
         return f"{TURN_USER}{head}{TURN_END}"
 
     def _screen_into(self, c, fid: int):

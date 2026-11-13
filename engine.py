@@ -1,8 +1,8 @@
 """engine.py — everything that touches MLX, on one thread.
 
 MLX ties GPU queues to the thread that created them, so a single GpuWorker thread
-owns the vision-language model (behind a small adapter), every screen read, every
-answer, and Kokoro text-to-speech. Other threads only hand it work.
+owns the vision-language model (behind a small adapter), every screen read and every
+answer. Other threads only hand it work.
 
 Pieces:
   - GemmaAdapter: load / set_budget / read_screen(image) -> Snapshot / generate(cache, ids)
@@ -10,8 +10,8 @@ Pieces:
         up to a fixed "Question:" marker after the image; the question is its own suffix.
       * spare cache copy prepared in the background (D12).
       * answers stop at the 3rd sentence or 120 tokens (D9); cancel checked every token (D6).
-  - Tts: Kokoro, one sentence at a time, cancel checked per sentence (D6). Kokoro's built-in
-    ~300 ms leading silence is trimmed; the first chunk can be an early phrase (first_chunk="phrase").
+  - AneTts: Kokoro on the Neural Engine in a helper process, one sentence at a time, cancel checked per
+    sentence (D6). Its leading silence is trimmed; the first chunk can be an early phrase (first_chunk="phrase").
   - GpuWorker: the scheduler. Answer jobs first; screen reads run in pieces and pause for
     answers (policy p2), or follow the MVP baseline (p0) / wait-for-read (p1) for comparison.
 """
@@ -43,7 +43,6 @@ import numpy as np  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 GEMMA_PATH = ROOT / "models/gemma-4-e4b-it-4bit"
-KOKORO_PATH = ROOT / "models/kokoro-82m-bf16"
 
 SPLIT_MARKER = "Question:"
 TURN_USER, TURN_END, TURN_MODEL = "<|turn>user\n", "<turn|>\n", "<|turn>model\n"
@@ -297,12 +296,12 @@ class GemmaAdapter:
     def __init__(self, path: Path = GEMMA_PATH, instruction: str = SPOKEN_INSTRUCTION,
                  skip_audio: bool = True, skip_shared: bool = True, stream_ple: bool = True,
                  fast_vision: bool = True, compile_vision: bool = True,
-                 vision_kernel: bool = True, vision_bits: int = 16, indexed_scales: bool = True,
+                 vision_kernel: bool = True, indexed_scales: bool = True,
                  swap_weights: bool = False):
         self.path = Path(path)
         self.instruction = instruction
         self.model = self.processor = None
-        # M1 (ARCHITECTURE.md §3.3): don't build Gemma's audio encoder (0.61 GB; WhisperKit does speech).
+        # M1 (ARCHITECTURE.md §3.3): don't build Gemma's audio encoder (0.61 GB; Parakeet does speech).
         self.skip_audio = skip_audio
         # G1 (§4.2): during prefill, run the 18 KV-shared layers only for the last token. They store
         # no cache, so the snapshot is bit-identical (checked 2026-11-06). No speed gain in reads (S0): MLX is
@@ -317,17 +316,13 @@ class GemmaAdapter:
         self.compile_vision = compile_vision
         # Custom Metal kernel for the vision q/k/v norm + 2D RoPE + layout (kernels/vision_qkv.py, §4.4).
         self.vision_kernel = vision_kernel
-        # §3.7: the image encoder's linear layers at 8-bit (group 64) save 139 MB; output features change about
-        # as much as compile_vision does. 16 = as shipped (bf16).
-        assert vision_bits in (16, 8, 4)
-        self.vision_bits = vision_bits
         # §3.8: store each text weight tensor's (scale, bias) pairs as a 16-bit index into a per-tensor table
         # (lossless; -143 MB); one-token matmuls run kernels/indexed_qmv.py, bit-identical to MLX's. Needs the
         # setup-time sidecar (python -m kernels.indexed_qmv build); skipped without it.
         self.indexed_scales = indexed_scales
         # §3.9: the image encoder (0.34 GB) is needed only while encoding a screen, the output layer (0.34 GB of
-        # codes) only to pick tokens; keep one in at a time. Needs bf16 vision weights (vision_bits 16).
-        self.swap_weights = swap_weights and vision_bits == 16
+        # codes) only to pick tokens; keep one in at a time.
+        self.swap_weights = swap_weights
 
     # -- setup
     def load(self):
@@ -346,13 +341,6 @@ class GemmaAdapter:
             tm.embed_tokens_per_layer = MMapPerLayerEmbedding(files[0], "language_model.model.embed_tokens_per_layer",
                                                               old.group_size, old.bits, getattr(old, "mode", "affine"))
             del old
-        if self.vision_bits < 16:
-            import mlx.nn as nn
-            # input_proj stays bf16: mlx-vlm casts image patches to input_proj.weight.dtype (vision.py:314),
-            # which would be a packed integer type once quantized.
-            nn.quantize(self.model.vision_tower, group_size=64, bits=self.vision_bits,
-                        class_predicate=lambda p, m: isinstance(m, nn.Linear) and m.weight.shape[-1] % 64 == 0
-                        and "input_proj" not in p)
         if self.indexed_scales:
             # Before evaluating: with the setup-time sidecar, the old scales/biases are never read at all.
             from kernels.indexed_qmv import index_scales, sidecar_path
@@ -837,45 +825,16 @@ class GemmaAdapter:
 
 # ---------------------------------------------------------------- text to speech
 
-class Tts:
-    """Kokoro 82M on MLX. Must be used on the GPU worker thread."""
-
-    def __init__(self, path: Path = KOKORO_PATH, voice: str = "af_heart", speed: float = 1.0):
-        self.path, self.voice, self.speed = Path(path), voice, speed
-        self.model = None
-        self.sample_rate = 24000
-
-    def load(self):
-        from mlx_audio.tts.utils import load_model
-        self.model = load_model(str(self.path))
-        return self
-
-    def synth(self, sentence: str, cancel: Optional[threading.Event] = None, trim: bool = True,
-              tail_keep_ms: float = 120) -> Iterator[np.ndarray]:
-        """Yields audio chunks. With trim, the first chunk loses its leading silence and every
-        chunk's trailing silence is cut to tail_keep_ms (short pad between sentences)."""
-        first = True
-        for r in self.model.generate(sentence, voice=self.voice, speed=self.speed, lang_code="a"):
-            if cancel is not None and cancel.is_set():
-                return
-            self.sample_rate = r.sample_rate
-            a = np.asarray(r.audio, dtype=np.float32).reshape(-1)
-            if trim:
-                a = trim_silence(a, r.sample_rate, lead_keep_ms=30 if first else 1e9, tail_keep_ms=tail_keep_ms)
-            first = False
-            yield a
-
-
 KOKORO_ANE_BIN = ROOT / "tools/parakeet/.build/release/kokoro-serve"
 KOKORO_ANE_DIR = ROOT / "models/kokoro-coreml"
 
 
 class AneTts:
     """Kokoro 82M through FluidAudio's KokoroAne (Core ML: Neural Engine + CPU), as a child process
-    (`tools/parakeet/Sources/kokoro-serve`). Same interface as Tts. No GPU time and no MLX memory:
+    (`tools/parakeet/Sources/kokoro-serve`). No GPU time and no MLX memory:
     0.19 GB loaded, 0.32 GB peak for the whole process, against MLX Kokoro's 0.33 GB + 0.4-1.7 GB of
     scratch per sentence (ARCHITECTURE.md §3.7). Text-to-phonemes runs in Swift, so Python never imports
-    mlx_audio / misaki / spaCy.
+    a text-to-phonemes library.
 
     Protocol: one UTF-8 line of text in; one "@@" + JSON line {"n", "seconds", "audio_s"} then n float32
     little-endian samples (24 kHz) out. Other stdout lines are library logging."""
@@ -944,7 +903,7 @@ class AneTts:
 
     def synth(self, sentence: str, cancel: Optional[threading.Event] = None, trim: bool = True,
               tail_keep_ms: float = 120) -> Iterator[np.ndarray]:
-        """Yields the sentence's audio as one chunk (trimmed like Tts.synth). Never raises for a helper failure:
+        """Yields the sentence's audio as one chunk (leading and trailing silence trimmed). Never raises for a helper failure:
         a dead helper is restarted and the text retried once; if that fails too, this text is skipped (no audio)
         and the failure counted in self.failures, so one bad sentence can't stop the GPU worker."""
         if cancel is not None and cancel.is_set():
@@ -988,16 +947,12 @@ class AneTts:
             p.kill()
 
 
-def make_tts(kind: str = "ane", sandbox_profile: Optional[Path] = None, log_dir: Optional[Path] = None):
-    """kind: 'ane' (default; Kokoro on the Neural Engine) or 'mlx' (Kokoro on the GPU). 'ane' falls back to
-    'mlx' with a message if its binary or models are missing."""
-    if kind == "ane":
-        t = AneTts(sandbox_profile=sandbox_profile, log_path=log_dir / "kokoro.log" if log_dir else None)
-        if t.available():
-            return t
-        print(f"Kokoro on the Neural Engine isn't set up ({t.binary}, {t.model_dir}); using MLX Kokoro. "
-              f"Run ./setup.sh to set it up.", flush=True)
-    return Tts()
+def make_tts(sandbox_profile: Optional[Path] = None, log_dir: Optional[Path] = None):
+    """Kokoro on the Neural Engine (ARCHITECTURE.md §3.7). Set up by ./setup.sh."""
+    t = AneTts(sandbox_profile=sandbox_profile, log_path=log_dir / "kokoro.log" if log_dir else None)
+    if not t.available():
+        raise RuntimeError(f"Kokoro on the Neural Engine isn't set up ({t.binary}, {t.model_dir}); run ./setup.sh.")
+    return t
 
 
 # ---------------------------------------------------------------- the GPU worker
@@ -1160,7 +1115,7 @@ class GpuWorker(threading.Thread):
              needs that frame, the encode moves to the GPU. Text prefill always runs on the GPU.
     """
 
-    def __init__(self, adapter: GemmaAdapter, tts: Tts, budget: int = 1120, warm_image=None,
+    def __init__(self, adapter: GemmaAdapter, tts: AneTts, budget: int = 1120, warm_image=None,
                  first_chunk: str = "phrase", trim_silence: bool = True, mlx_cache_gb: float = 0.0,
                  policy: str = "p2", freshness: str = "B", fresh_ms: float = 300.0,
                  layers_per_piece: int = 2, min_read_interval_s: float = 0.0, duty_cap: float = 1.0,

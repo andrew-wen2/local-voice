@@ -293,15 +293,14 @@ class StreamCapturer:
             self._stream = None
 
 
-def open_capture(method: str = "stream"):
-    """The app's screen source: (capturer, grab_small or None). "stream" = ScreenCaptureKit (§8.6, ~5x less
-    CPU than a `screencapture` process per poll); falls back to "screencapture" if the stream can't start."""
-    if method == "stream":
-        try:
-            cap = StreamCapturer().start()
-            return cap, cap.grab_small
-        except Exception as e:                        # older macOS, missing bindings, permission quirks
-            print(f"ScreenCaptureKit unavailable ({e}); using screencapture", flush=True)
+def open_capture():
+    """The app's screen source: (capturer, grab_small or None). A ScreenCaptureKit stream (§8.6, ~5x less CPU
+    than a `screencapture` process per poll); falls back to `screencapture` only if the stream can't start."""
+    try:
+        cap = StreamCapturer().start()
+        return cap, cap.grab_small
+    except Exception as e:                            # older macOS, missing bindings, permission quirks
+        print(f"ScreenCaptureKit unavailable ({e}); using screencapture", flush=True)
     return Capturer(fmt="jpg"), None
 
 

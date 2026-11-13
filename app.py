@@ -37,7 +37,7 @@ import numpy as np  # noqa: E402
 import screen as scr  # noqa: E402
 from asr import AsrError, make_asr  # noqa: E402
 from audio_io import Mic, Speaker, near_silent, rms_dbfs  # noqa: E402
-from engine import RECALL_INSTRUCTION, AneTts, AnswerJob, GemmaAdapter, GpuWorker, make_tts  # noqa: E402
+from engine import RECALL_INSTRUCTION, AnswerJob, GemmaAdapter, GpuWorker, make_tts  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
@@ -131,23 +131,20 @@ class Monitor(threading.Thread):
 # ---------------------------------------------------------------- the assistant
 
 class Assistant:
-    def __init__(self, budget: int = 1120, sandbox_profile: Optional[Path] = None, asr: str = "parakeet",
-                 tts: str = "ane", vision_bits: int = 16, swap_weights: bool = True, **worker_opts):
+    def __init__(self, budget: int = 1120, sandbox_profile: Optional[Path] = None, swap_weights: bool = True,
+                 **worker_opts):
         """worker_opts go to GpuWorker: first_chunk, trim_silence, mlx_cache_gb, policy, freshness,
         fresh_ms, layers_per_piece, min_read_interval_s, duty_cap."""
         self.budget = budget
         self.worker_opts = worker_opts
         LOGS.mkdir(exist_ok=True)
-        self.asr_kind = asr
-        self.asr = make_asr(asr, log_dir=LOGS)
+        self.asr = make_asr(log_dir=LOGS)
         self.sandbox_profile = sandbox_profile
-        self.tts = make_tts(tts, sandbox_profile=sandbox_profile, log_dir=LOGS)
-        self.tts_kind = "ane" if isinstance(self.tts, AneTts) else "mlx"
-        self.vision_bits = vision_bits
+        self.tts = make_tts(sandbox_profile=sandbox_profile, log_dir=LOGS)
         self.swap_weights = swap_weights
         self.worker: Optional[GpuWorker] = None
         self.monitor = Monitor(lambda: {"app": os.getpid(), "asr": self.asr.pid(), "ane": self._ane_pid(),
-                                        "tts": self.tts.pid() if hasattr(self.tts, "pid") else None})
+                                        "tts": self.tts.pid()})
         self.startup: dict = {}
         self.ready = False
 
@@ -155,15 +152,12 @@ class Assistant:
         """Readiness gate (D8): ASR healthy + warm, models loaded + warm, first screen read done."""
         t_all = time.perf_counter()
         self.monitor.start()
-        self.startup["asr"] = self.asr_kind
         self.startup["asr_start_s"] = round(self.asr.start(sandbox_profile=self.sandbox_profile), 2)
         t0 = time.perf_counter()
         self.asr.transcribe((QDIR / "v01.wav").read_bytes())
         self.startup["asr_warm_s"] = round(time.perf_counter() - t0, 2)
-        self.startup["tts"] = self.tts_kind
-        self.startup["vision_bits"] = self.vision_bits
         self.startup["swap_weights"] = self.swap_weights
-        self.worker = GpuWorker(GemmaAdapter(vision_bits=self.vision_bits, swap_weights=self.swap_weights), self.tts,
+        self.worker = GpuWorker(GemmaAdapter(swap_weights=self.swap_weights), self.tts,
                                 budget=self.budget,
                                 warm_image=warm_image,
                                 **self.worker_opts)
@@ -269,10 +263,8 @@ def live(args):
               "Turn it on in System Settings > Privacy & Security > Screen & System Audio Recording,\n"
               "then restart the terminal. (Without it, macOS returns only the wallpaper.)")
         sys.exit(2)
-    cap, grab_small = scr.open_capture(getattr(args, "capture", "stream"))
-    asst = Assistant(budget=args.budget, asr=args.asr, tts=getattr(args, "tts", "ane"),
-                     vision_bits=getattr(args, "vision_bits", 16), swap_weights=getattr(args, "swap_weights", "on") == "on",
-                     **worker_opts(args))
+    cap, grab_small = scr.open_capture()
+    asst = Assistant(budget=args.budget, swap_weights=getattr(args, "swap_weights", "on") == "on", **worker_opts(args))
     speaker = Speaker().start()
     mic = Mic().start()
     print("starting (first launch can take a few minutes)...", flush=True)
@@ -407,16 +399,15 @@ def live_recall(args):
         sys.exit(2)
     LOGS.mkdir(exist_ok=True)
     t_all = time.perf_counter()
-    cap, grab_small = scr.open_capture(getattr(args, "capture", "stream"))
-    asr = make_asr(args.asr, log_dir=LOGS)
+    cap, grab_small = scr.open_capture()
+    asr = make_asr(log_dir=LOGS)
     asr.start(sandbox_profile=None)
     asr.transcribe((QDIR / "v01.wav").read_bytes())
-    tts = make_tts(getattr(args, "tts", "ane"), log_dir=LOGS)
+    tts = make_tts(log_dir=LOGS)
     store = Store()
     screens = ScreenStore()                          # kept screens: owner-only folder, deleted on quit (§5.12)
     o = worker_opts(args)
-    adapter = GemmaAdapter(vision_bits=getattr(args, "vision_bits", 16),
-                           swap_weights=getattr(args, "swap_weights", "on") == "on", instruction=RECALL_INSTRUCTION)
+    adapter = GemmaAdapter(swap_weights=getattr(args, "swap_weights", "on") == "on", instruction=RECALL_INSTRUCTION)
     worker = RecallWorker(adapter, tts, store, budget=args.budget, freshness="C" if o["freshness"] == "C" else "B",
                           first_chunk=o["first_chunk"], trim_silence=o["trim_silence"], mlx_cache_gb=o["mlx_cache_gb"],
                           screen_store=screens)
@@ -738,7 +729,6 @@ def replay(args):
     else:
         cases = sets[args.replay]
     asst = Assistant(budget=args.budget, sandbox_profile=Path(args.sandbox_profile) if args.sandbox_profile else None,
-                     asr=args.asr, tts=getattr(args, "tts", "ane"), vision_bits=getattr(args, "vision_bits", 16),
                      swap_weights=getattr(args, "swap_weights", "on") == "on", **worker_opts(args))
     first = cases[0].get("before") or cases[0].get("screen")
     asst.start(warm_image=screens[first], first_frame=(1, time.time(), screens[first]))
@@ -771,12 +761,12 @@ def replay(args):
                                                      "fresh_decision", "read_paused", "answer")}),
                   flush=True)
     asst.stop()
-    out = LOGS / f"replay-{args.replay}-{args.budget}-{args.asr}-{getattr(args, 'policy', 'p2')}{getattr(args, 'freshness', 'B')}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    out = LOGS / f"replay-{args.replay}-{args.budget}-{getattr(args, 'policy', 'p2')}{getattr(args, 'freshness', 'B')}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     with out.open("w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
     summary = summarize(results)
-    summary.update(set=args.replay, budget=args.budget, asr=args.asr, policy=getattr(args, "policy", "p2"),
+    summary.update(set=args.replay, budget=args.budget, policy=getattr(args, "policy", "p2"),
                    freshness=getattr(args, "freshness", "B"), startup=asst.startup, log=str(out),
                    reads_dropped=asst.worker.stats.get("reads_dropped"))
     runner = asst.worker.ane_runner
@@ -822,20 +812,12 @@ def add_worker_args(ap):
     ap.add_argument("--placement", choices=["gpu", "split"], default="gpu",
                     help="image encoder: gpu (default) or split = P4, quiet-time encodes on the Neural Engine (ane_vision.py)")
     ap.add_argument("--ane-root", default=None, help="folder of converted Core ML encoders (default models/vision-coreml)")
-    ap.add_argument("--asr", choices=["parakeet", "whisper"], default="parakeet",
-                    help="speech recognition: Parakeet TDT 0.6B v2 (default, ~40 ms) or WhisperKit large-v3 turbo (~470 ms)")
     ap.add_argument("--show-text", action="store_true",
                     help="print the transcript and answer in the terminal (the assistant can then read them on screen)")
     ap.add_argument("--hotkey", choices=["right_option", "right_command", "right_control", "fn", "none"],
                     default="right_option", help="hold this key in any app to talk (needs Input Monitoring permission)")
     ap.add_argument("--swap-weights", choices=["on", "off"], default="on",
                     help="keep only one of the image encoder / output layer in memory at a time (-0.33 GB, §3.9)")
-    ap.add_argument("--vision-bits", type=int, choices=[16, 8], default=16,
-                    help="image encoder weights: 16 (bf16, as shipped) or 8 (-139 MB, ARCHITECTURE.md §3.7)")
-    ap.add_argument("--tts", choices=["ane", "mlx"], default="ane",
-                    help="speech output: Kokoro on the Neural Engine (default, kokoro-serve) or MLX Kokoro on the GPU")
-    ap.add_argument("--capture", choices=["stream", "screencapture"], default="stream",
-                    help="screen source: ScreenCaptureKit stream (default) or a screencapture process per poll")
     ap.add_argument("--history", choices=["on", "off", "auto"], default="auto",
                     help="conversation history in the context: auto = on live, off in replays (independent test questions)")
 

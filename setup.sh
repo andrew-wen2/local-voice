@@ -2,8 +2,8 @@
 # One-step setup for local-voice on an Apple silicon Mac (built and measured on a base M5, 16 GB, macOS 26).
 #
 #   ./setup.sh            # Python env, Swift helpers, default models (~6 GB download the first time)
-#   ./setup.sh --extras   # also the optional pieces: the speculative-decoding drafter, WhisperKit, the
-#                         # Neural Engine image encoder (converted locally, takes a while)
+#   ./setup.sh --extras   # also the Neural Engine image encoder for kept screens (converted locally,
+#                         # takes a while; without it they are encoded on the GPU)
 #
 # Safe to re-run: every step skips what is already there. Everything the app runs offline afterwards;
 # downloads happen only here. Model revisions are pinned to the ones the results were measured with.
@@ -35,7 +35,6 @@ fetch() {   # fetch <repo> <revision> <dir>
   "$HF" download "$1" --revision "$2" --local-dir "$3"
 }
 fetch mlx-community/gemma-4-e4b-it-4bit 475b9088d29754a3379866cf5aeb6b41acd313c2 models/gemma-4-e4b-it-4bit
-fetch mlx-community/Kokoro-82M-bf16 a71e4d38b236d968966a2002c4c895dbd12b1c3c models/kokoro-82m-bf16
 if [[ -d models/parakeet-tdt-0.6b-v2/Encoder.mlmodelc ]]; then
   echo "  models/parakeet-tdt-0.6b-v2: present"
 else   # Core ML bundles via FluidAudio 0.18.2 (pinned in tools/parakeet/Package.swift)
@@ -52,14 +51,6 @@ fi
 
 if (( EXTRAS )); then
   step "Extras"
-  fetch mlx-community/gemma-4-E4B-it-assistant-bf16 844e008e06ef5562bdb89428d851d0634d119dcd models/gemma-4-e4b-it-assistant-bf16
-  if [[ ! -d models/whisperkit-coreml/openai_whisper-large-v3-v20240930_turbo_632MB ]]; then
-    "$HF" download argmaxinc/whisperkit-coreml --revision 0f63a7800b00dd0226abd051b906c246e1907482 \
-      --include "openai_whisper-large-v3-v20240930_turbo_632MB/*" --local-dir models/whisperkit-coreml
-    # WhisperKit looks for its tokenizer under <dir>/models/openai/whisper-large-v3
-    "$HF" download openai/whisper-large-v3 --revision 06f233fe06e710322aca913c1bc4249a0d71fce1 --include "tokenizer.json" "tokenizer_config.json" "config.json" \
-      --local-dir models/whisper-tokenizer/models/openai/whisper-large-v3
-  fi
   [[ -d models/vision-coreml ]] || .venv/bin/python ane_vision.py convert
 fi
 

@@ -1,5 +1,5 @@
-"""Tests for asr.py. Fast: server-down error paths, WAV encoding, Parakeet on the recorded questions
-(skipped if its binary or models are missing). Slow: real WhisperKit on the recorded questions."""
+"""Tests for asr.py: server-down error paths, WAV encoding, Parakeet on the recorded questions
+(skipped if its binary or models are missing)."""
 import io
 import json
 import re
@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from asr import PARAKEET_BIN, PARAKEET_DIR, AsrError, ParakeetServer, WhisperServer, make_asr, wav_bytes, wav_to_samples
+from asr import PARAKEET_BIN, PARAKEET_DIR, AsrError, ParakeetServer, make_asr, wav_bytes, wav_to_samples
 
 ROOT = Path(__file__).resolve().parents[1]
 QDIR = ROOT / "harness/questions"
@@ -21,13 +21,6 @@ def test_wav_bytes_roundtrip():
         assert (w.getframerate(), w.getnchannels(), w.getnframes()) == (16000, 1, 16000)
 
 
-def test_server_down_gives_clear_error():
-    s = WhisperServer(port=50999)          # nothing listening here
-    assert not s.healthy()
-    with pytest.raises(AsrError, match="speech recognition failed"):
-        s.transcribe(np.zeros(1600, np.float32), timeout_s=2)
-
-
 def _norm(t):
     t = re.sub(r"[^a-z0-9 ]", "", t.lower())
     for a, b in (("thirty one", "31"), ("three and a half", "35"), ("35", "35")):
@@ -35,43 +28,13 @@ def _norm(t):
     return " ".join(t.split())
 
 
-@pytest.mark.slow
-def test_transcribes_recorded_questions():
-    s = WhisperServer(log_path=ROOT / "logs/whisperkit-test.log")
-    (ROOT / "logs").mkdir(exist_ok=True)
-    s.start()
-    try:
-        qs = json.loads((QDIR / "index.json").read_text())
-        bad = []
-        for q in qs:
-            r = s.transcribe((QDIR / q["file"]).read_bytes())
-            if _norm(r["text"]) != _norm(q["text"]):
-                bad.append((q["text"], r["text"]))
-        assert not bad, bad
-    finally:
-        s.stop()
-
-
-def test_short_clip_is_padded_to_min_length():
-    import numpy as np
-    from asr import MIN_CLIP_S, pad_short
-    a = np.ones(int(0.92 * 16000), np.float32)
-    out = pad_short(a)
-    assert len(out) == int(MIN_CLIP_S * 16000) and out[:len(a)].all() and not out[len(a):].any()
-    long = np.ones(32000, np.float32)
-    assert len(pad_short(long)) == 32000
-
-
 def test_wav_to_samples_roundtrip():
     x = (np.sin(np.linspace(0, 100, 16000)) * 0.5).astype(np.float32)
     assert np.abs(wav_to_samples(wav_bytes(x)) - x).max() < 1e-4
 
 
-def test_make_asr_kinds():
-    assert isinstance(make_asr("parakeet"), ParakeetServer)
-    assert isinstance(make_asr("whisper"), WhisperServer)
-    with pytest.raises(ValueError):
-        make_asr("nope")
+def test_make_asr_is_parakeet():
+    assert isinstance(make_asr(), ParakeetServer)
 
 
 def test_parakeet_not_running_gives_clear_error():
@@ -90,7 +53,7 @@ needs_parakeet = pytest.mark.skipif(not (PARAKEET_BIN.exists() and (PARAKEET_DIR
                                     reason="Parakeet binary or models not present")
 
 # Script text vs what Parakeet writes: formatting differences only (identifiers spoken as words), plus
-# one known word error (rd01 "as" -> "is"), measured 2026-11-06 (eval/asr_compare.py).
+# one known word error (rd01 "as" -> "is"), measured 2026-11-06.
 PARAKEET_KNOWN = {"rd01", "rd02", "rd05", "rd06", "rd12", "rd13"}
 
 
