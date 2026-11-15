@@ -118,6 +118,24 @@ def test_partials_and_final_from_partial():
     assert p.final_text() is None
 
 
+def test_a_partial_runs_when_speech_stops_so_the_final_is_skipped():
+    """M3 (2026-11-13): 0.1 s after the last voiced block, a partial runs even with less than min_new of new audio,
+    so with a pause before key up the last partial covers every voiced sample (no final transcription)."""
+    audio, voiced, got = [np.zeros(16000, np.float32)], [16000], []
+    p = Partials(FakeAsr(), lambda: audio[0], lambda: voiced[0], got.append, every_s=10.0, tick_s=0.01)
+    assert p.step()                                           # a partial at 1.0 s
+    audio[0], voiced[0] = np.zeros(16000 + 1600, np.float32), 16000 + 1600   # 0.1 s more speech, still talking
+    assert not p.settled(len(audio[0])) and p.final_text() is None
+    audio[0] = np.zeros(16000 + 1600 + 1600, np.float32)      # then 0.1 s of silence
+    assert p.settled(len(audio[0]))
+    p.start()
+    deadline = time.time() + 2
+    while p.final_text() is None and time.time() < deadline:
+        time.sleep(0.01)
+    p.finish()
+    assert p.final_text() is not None and p.stats["settled"] == 1   # once: then the partial covers the speech
+
+
 # ---------------------------------------------------------------- cutting a cache back
 
 @pytest.mark.parametrize("chunk", [1, 3, 5])
@@ -175,7 +193,8 @@ def test_worker_turn_on_the_simulated_backend():
     w.stop()
     w.join(5)
     r = io.result
-    assert r["cancelled"] is False and r["release_s"] >= 0 and r["retrievals"] == 2
+    # the partial is retrieved only if the loop reaches it before key up (M3 2026-11-15: Retrieve job); the final always
+    assert r["cancelled"] is False and r["release_s"] >= 0 and r["retrievals"] in (1, 2)
     assert ("build", ("A", 1, 1)) in be.calls and ("build", ("B", 1, 1)) in be.calls
     assert w.sched.ex_done == 1
 

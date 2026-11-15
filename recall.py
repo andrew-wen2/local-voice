@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
+import numpy as np
+
 from memory import Memory, Page
 
 # ---------------------------------------------------------------- page key and text (§12.9)
@@ -389,7 +391,7 @@ class FrameKeeper:
         new = [ln for ln in (x.strip() for x in lines) if ln and ln not in seen]
         reason = "new text" if new or key not in self.last_small else None
         if reason is None:
-            prev = self.last_small[key]
+            prev = _unpack(self.last_small[key])
             if small is not None and prev is not None:
                 if prev.shape != small.shape:
                     reason = "changed"
@@ -401,8 +403,26 @@ class FrameKeeper:
                         reason = "changed"
         if reason is not None:
             seen.update(x.strip() for x in lines if x.strip())
-            self.last_small[key] = small
+            self.last_small[key] = _pack(small)
         return reason
+
+
+def _pack(a):
+    """A page's last kept thumbnail, zlib-compressed (lossless): ~1.1 MB each as an array, one per page, grew with
+    the hour (M3, 2026-11-13)."""
+    import zlib
+    if a is None:
+        return None
+    a = np.asarray(a)
+    return (a.shape, a.dtype.str, zlib.compress(np.ascontiguousarray(a).tobytes(), 1))
+
+
+def _unpack(p):
+    import zlib
+    if p is None:
+        return None
+    shape, dt, z = p
+    return np.frombuffer(zlib.decompress(z), dtype=np.dtype(dt)).reshape(shape)
 
 
 # ---------------------------------------------------------------- OCR (Apple Vision)
@@ -410,24 +430,30 @@ class FrameKeeper:
 def ocr_image(img) -> tuple[list[str], list[list[float]]]:
     """Accurate-mode OCR of a PIL screenshot (device pixels, 2 per point). Returns (lines, boxes in points:
     x, y from the top-left, w, h), as eval/real/ocr.py writes them."""
+    import objc
     import Quartz
     import Vision
+    from Foundation import NSData
     rgb = img.convert("RGBA")
     W, H = rgb.size
-    data = rgb.tobytes()
-    provider = Quartz.CGDataProviderCreateWithData(None, data, len(data), None)
-    cg = Quartz.CGImageCreate(W, H, 8, 32, W * 4, Quartz.CGColorSpaceCreateDeviceRGB(),
-                              Quartz.kCGImageAlphaNoneSkipLast, provider, None, False,
-                              Quartz.kCGRenderingIntentDefault)
-    req = Vision.VNRecognizeTextRequest.alloc().init()
-    req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-    req.setUsesLanguageCorrection_(False)
-    Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg, None).performRequests_error_([req], None)
-    res = req.results() or []
-    Wp, Hp = W / 2, H / 2
-    lines = [o.topCandidates_(1)[0].string() for o in res]
-    boxes = [[round(b.origin.x * Wp, 1), round((1 - b.origin.y - b.size.height) * Hp, 1),
-              round(b.size.width * Wp, 1), round(b.size.height * Hp, 1)] for b in (o.boundingBox() for o in res)]
+    # The provider owns a copy of the pixels (CFData) and every Objective-C object made here is released when the pool
+    # drains. CGDataProviderCreateWithData on Python bytes, or no pool on this long-lived thread, leaked one full
+    # RGBA frame (~24 MB at 3024x1964) per call (M3 baseline, 2026-11-13).
+    with objc.autorelease_pool():
+        data = NSData.dataWithBytes_length_(rgb.tobytes(), W * H * 4)
+        provider = Quartz.CGDataProviderCreateWithCFData(data)
+        cg = Quartz.CGImageCreate(W, H, 8, 32, W * 4, Quartz.CGColorSpaceCreateDeviceRGB(),
+                                  Quartz.kCGImageAlphaNoneSkipLast, provider, None, False,
+                                  Quartz.kCGRenderingIntentDefault)
+        req = Vision.VNRecognizeTextRequest.alloc().init()
+        req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        req.setUsesLanguageCorrection_(False)
+        Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg, None).performRequests_error_([req], None)
+        res = req.results() or []
+        Wp, Hp = W / 2, H / 2
+        lines = [str(o.topCandidates_(1)[0].string()) for o in res]
+        boxes = [[round(b.origin.x * Wp, 1), round((1 - b.origin.y - b.size.height) * Hp, 1),
+                  round(b.size.width * Wp, 1), round(b.size.height * Hp, 1)] for b in (o.boundingBox() for o in res)]
     return lines, boxes
 
 

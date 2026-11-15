@@ -2,7 +2,9 @@
 
 A kept screen is its vision features (the encoder's output, ~1,066 image tokens; written to disk, owner-only, int8 with a
 scale per token: Andrew's default, 2026-11-11, ~2.7 MB instead of ~5.5 MB a screen) and its
-retrieval keys (image-token keys of full-attention layers 11 and 17, int8 with a scale per key; kept in memory),
+retrieval keys (image-token keys of full-attention layers 11 and 17, int8 with a scale per key; written to disk too
+and memory-mapped, so the app's memory doesn't grow with the hour: macOS keeps them in spare RAM and drops them under
+pressure; Andrew, 2026-11-13),
 plus what the text index needs: time, page key, title, page-area OCR lines. No screenshot is stored: a frame's image
 is held only until it has been encoded.
 
@@ -42,7 +44,7 @@ class Screen:
     key: str                      # page key (§12.9)
     title: str
     lines: list
-    keys: dict = field(default_factory=dict)      # layer -> (int8 [kv heads, n_img, D], float16 scales [.., 1])
+    keys: dict = field(default_factory=dict)      # layer -> (int8 [kv heads, n_img, D], float16 scales [.., 1]); memory-mapped once added
     null: dict = field(default_factory=dict)      # layer -> this frame's score for the content-free query
     path: Optional[Path] = None   # vision features on disk
     size: tuple = (0, 0)          # the frame's size in pixels (the processor's resize, so the token count, depends on it)
@@ -86,7 +88,20 @@ class ScreenStore:
         z = np.load(path)
         return (z["q"].astype(np.float32) * z["s"].astype(np.float32)).astype(np.float16)
 
+    def _map_keys(self, s: Screen):
+        """Write a screen's keys to its own two files and replace them with memory-mapped views of those files."""
+        if not s.keys or all(isinstance(k, np.memmap) for kv in s.keys.values() for k in kv):
+            return
+        Ls = sorted(s.keys)
+        paths = (self.dir / f"{s.fid}.keys.npy", self.dir / f"{s.fid}.scales.npy")
+        for path, j in zip(paths, (0, 1)):
+            np.save(path, np.stack([np.asarray(s.keys[L][j]) for L in Ls]))
+            os.chmod(path, 0o600)
+        k, sc = (np.load(p, mmap_mode="r") for p in paths)
+        s.keys = {L: (k[i], sc[i]) for i, L in enumerate(Ls)}
+
     def add(self, s: Screen):
+        self._map_keys(s)
         with self.lock:
             extra = self._more.pop(s.fid, [])
             if extra:
@@ -115,8 +130,9 @@ class ScreenStore:
             old = [f for f, s in self.screens.items() if now_t - s.t > self.horizon_s]
             for f in old:
                 s = self.screens.pop(f)
-                if s.path is not None:
-                    s.path.unlink(missing_ok=True)
+                for p in (s.path, self.dir / f"{f}.keys.npy", self.dir / f"{f}.scales.npy"):
+                    if p is not None:
+                        p.unlink(missing_ok=True)       # a mapping still in use stays valid until it is dropped
             if old:
                 self.version += 1
                 self._bm25 = None

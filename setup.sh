@@ -43,6 +43,9 @@ fi
 if [[ ! -f models/gemma-4-e4b-it-4bit/indexed_scales.safetensors ]]; then   # lossless scale index (§3.8), ~3 s
   .venv/bin/python -m kernels.indexed_qmv build
 fi
+if [[ ! -f models/gemma-4-e4b-it-4bit/lean_tokenizer.npz || ! -f models/gemma-4-e4b-it-4bit/lean_chat.json ]]; then
+  .venv/bin/python -m lean_tok build      # the app's own tokenizer and prompt template (no Hugging Face tokenizer in memory)
+fi
 if [[ -d models/kokoro-coreml/kokoro-82m-coreml ]]; then
   echo "  models/kokoro-coreml: present"
 else   # Kokoro on the Neural Engine (the default speech output), via FluidAudio 0.18.2

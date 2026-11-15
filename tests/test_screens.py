@@ -72,10 +72,20 @@ class FakeAdapter:
 
 
 class FakeAne:
+    """Four chunks; each records whether the encoder's quiet() held when it started."""
+
+    def __init__(self, quiet=None, chunk_s=0.0):
+        self.quiet, self.chunk_s, self.chunks = quiet, chunk_s, []
+
     def has(self, h, w):
         return True
 
-    def encode(self, pv):
+    def encode_steps(self, pv):
+        for i in range(4):
+            self.chunks.append(self.quiet() if self.quiet else True)
+            time.sleep(self.chunk_s)
+            if i < 3:
+                yield i + 1, 4, i + 1, None
         return np.ones((1, 4, 2), np.float32)
 
 
@@ -97,6 +107,32 @@ def test_encoder_uses_the_neural_engine_or_hands_the_image_over():
         p = st.take_pending(5)
         assert ready == [5] and p[want] is not None and p["meta"]["size"] == (64, 32)
         st.close()
+
+
+def test_no_encoder_chunk_starts_during_a_turn():
+    """M3 (2026-11-13): a turn that starts mid-encode stops further Neural Engine chunks until it ends; the encode
+    then continues where it was (speech recognition and Kokoro need the Neural Engine during a turn)."""
+    st, ready, quiet = ScreenStore(), [], threading.Event()
+    quiet.set()
+    ane = FakeAne(quiet=quiet.is_set, chunk_s=0.05)
+    e = ScreenEncoder(FakeAdapter(), st, quiet=quiet.is_set, on_ready=ready.append, ane=ane)
+    e.start()
+    e.submit(5, Image.new("RGB", (64, 32)), {"t": 1.0, "key": "k", "title": "t", "lines": []})
+    while not ane.chunks:
+        time.sleep(0.005)
+    quiet.clear()                                # the talk key, during the first chunk
+    time.sleep(0.3)
+    assert len(ane.chunks) == 1 and ready == []
+    quiet.set()
+    e.poke()
+    for _ in range(100):
+        if ready:
+            break
+        time.sleep(0.01)
+    e.stop()
+    assert ready == [5] and ane.chunks == [True] * 4 and e.stats["paused"] == 1
+    assert st.take_pending(5)["tokens"] is not None
+    st.close()
 
 
 T = {"prep": .001, "patch": .001, "vision": .001, "pool": .001, "embed": .001, "text": .001,

@@ -93,11 +93,11 @@ def take(lay: Layout, cache, pos: int, window) -> Piece:
                 k, v = _temporal(c)
                 m = n if window == "all" else min(n, lay.W)
                 assert k.shape[2] >= m, "window entries already rotated out of the buffer"
-                win[i] = (k[:, :, -m:], v[:, :, -m:])
+                win[i] = (mx.contiguous(k[:, :, -m:]), mx.contiguous(v[:, :, -m:]))
         else:
             k, v = c.state
-            full[i] = (k[:, :, pos:pos + n], v[:, :, pos:pos + n])
-    p = Piece(n, pos, full, win)
+            full[i] = (mx.contiguous(k[:, :, pos:pos + n]), mx.contiguous(v[:, :, pos:pos + n]))
+    p = Piece(n, pos, full, win)        # copies: an MLX slice keeps its parent's whole buffer alive
     mx.eval([x for kv in list(full.values()) + list((win or {}).values()) for x in kv])
     return p
 

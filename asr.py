@@ -148,22 +148,33 @@ class Partials(threading.Thread):
     get_audio() -> samples so far; voiced_until() -> sample index where the last voiced block ended;
     on_partial(text) for each changed transcript. `final_text()` after the key is released: the last partial
     when it covered every voiced sample (so the rest of the recording is silence), else None and the caller
-    transcribes the whole recording. Settings are provisional (set before measuring)."""
+    transcribes the whole recording. Settings are provisional (set before measuring).
+
+    A partial also runs as soon as speech stops (`settle_s` of silence after the last voiced block that the last
+    partial didn't reach), not only on the `every_s` tick: when you pause before releasing the key, the last partial
+    then covers everything and the final transcription is skipped (M3, 2026-11-13)."""
 
     def __init__(self, asr, get_audio, voiced_until, on_partial, every_s: float = 0.3, min_new_s: float = 0.25,
-                 min_audio_s: float = 0.5, sr: int = 16000):
+                 min_audio_s: float = 0.5, sr: int = 16000, settle_s: float = 0.1, tick_s: float = 0.05):
         super().__init__(daemon=True, name="asr-partials")
         self.asr, self.get_audio, self.voiced_until, self.on_partial = asr, get_audio, voiced_until, on_partial
         self.every_s, self.min_new, self.min_audio, self.sr = every_s, int(min_new_s * sr), int(min_audio_s * sr), sr
+        self.settle, self.tick_s = int(settle_s * sr), tick_s
         self.stop_ev = threading.Event()
         self.last: Optional[tuple[int, str]] = None     # (samples covered, text)
-        self.stats = {"partials": 0, "calls": 0, "asr_s": 0.0, "errors": 0}
+        self.stats = {"partials": 0, "calls": 0, "asr_s": 0.0, "errors": 0, "settled": 0}
 
-    def step(self) -> bool:
-        """Transcribe the audio so far if enough is new. Returns True if it ran."""
+    def settled(self, n: int) -> bool:
+        """Speech stopped (settle_s of silence after the last voiced block) and the last partial didn't reach it."""
+        v = self.voiced_until()
+        covered = self.last[0] if self.last else 0
+        return 0 <= v and covered < v and n - v >= self.settle
+
+    def step(self, force: bool = False) -> bool:
+        """Transcribe the audio so far if enough is new (or `force`). Returns True if it ran."""
         x = self.get_audio()
         covered = self.last[0] if self.last else 0
-        if len(x) < self.min_audio or len(x) - covered < self.min_new or self.voiced_until() < 0:
+        if len(x) < self.min_audio or self.voiced_until() < 0 or (not force and len(x) - covered < self.min_new):
             return False
         try:
             r = self.asr.transcribe(x)
@@ -180,8 +191,14 @@ class Partials(threading.Thread):
         return True
 
     def run(self):
-        while not self.stop_ev.wait(self.every_s):
-            self.step()
+        import time
+        last = time.perf_counter()
+        while not self.stop_ev.wait(self.tick_s):
+            settled = self.settled(len(self.get_audio()))
+            if settled or time.perf_counter() - last >= self.every_s:
+                if self.step(force=settled) and settled:
+                    self.stats["settled"] += 1
+                last = time.perf_counter()
 
     def finish(self, timeout: float = 2.0):
         self.stop_ev.set()

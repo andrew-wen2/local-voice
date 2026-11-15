@@ -32,11 +32,13 @@ def turn(t0=10.0, words="what was the price", up=1.3, silent=1.0, final_lag=0.03
 
 def limits_held(s):
     """Every IMPROVING / BACKGROUND piece fit its state's limit when it started."""
-    return all(est <= PIECE_LIMIT_S[st] + 1e-9 for _, _, st, c, _, est in s.log if c >= Cls.IMPROVING)
+    lim = {**PIECE_LIMIT_S, State.RELEASED: PIECE_LIMIT_S[State.TAIL]}     # before the final transcript (_near_up)
+    return all(est <= lim[st] + 1e-9 for _, _, st, c, _, est in s.log if c >= Cls.IMPROVING)
 
 
 def classes_allowed(s):
-    return all(c in ALLOWED[st] for _, _, st, c, _, _ in s.log)
+    # IMPROVING runs after key up only until the final transcript is in (scheduler._near_up)
+    return all(c in ALLOWED[st] or (st is State.RELEASED and c is Cls.IMPROVING) for _, _, st, c, _, _ in s.log)
 
 
 def test_still_screen_turn_speculation_covers_the_question():
@@ -52,12 +54,27 @@ def test_still_screen_turn_speculation_covers_the_question():
     assert limits_held(s) and classes_allowed(s)
 
 
-def test_no_tail_means_question_prefilled_at_release():
+def test_no_tail_means_question_prefilled_while_the_final_transcript_comes():
+    """M3 (2026-11-15): with no quiet tail, the question prefill starts at key up, in the ~30 ms before the final
+    transcript, and finishes before the answer once the final transcript keeps it; it isn't redone in the answer.
+    Before: all of it after the final transcript, 0.03 + assemble + 6 question pieces."""
     s, _, _ = make()
     simulate(s, turn(silent=None, up=0.6))
+    t = s.turns[-1]
+    p = t["plan"]
+    assert p["question_reused"] == 4 and p["prefill"] == 0
+    assert t["pieces"]["RELEASED:IMPROVING:q_layers"] > 0 and t["pieces"]["RELEASED:CRITICAL:q_layers"] > 0
+    assert t["release_s"] < 0.03 + T["assemble"] + 6 * T["q_layers"] - 0.005
+    assert limits_held(s) and classes_allowed(s)
+
+
+def test_a_prefill_the_final_transcript_changes_is_dropped():
+    """The same, but the final transcript differs from the last partial: the started prefill is stale, the answer
+    prefills the final words itself."""
+    s, _, _ = make()
+    simulate(s, turn(silent=None, up=0.6, words="what was the cost", partials=((0.3, "what was the price"),)))
     p = s.turns[-1]["plan"]
-    assert p["question_reused"] == 0 and p["prefill"] == 4
-    assert s.turns[-1]["release_s"] == pytest.approx(0.03 + T["assemble"] + 6 * T["q_layers"])
+    assert p["question_reused"] == 0 and p["prefill"] == 4 and p["words"][-1] == "cost"
 
 
 def test_retrieval_change_cuts_the_exact_frontier():
@@ -238,3 +255,125 @@ def test_a_failing_answer_closes_its_turn_and_the_loop_goes_on():
     be.answer = real
     simulate(s, turn(t0=20.0))
     assert s.turns[-1]["cancelled"] is False and s.stats["errors"] == 1
+
+
+def test_runner_up_context_is_ready_when_retrieval_switches_late():
+    """M3 (2026-11-13): with time to spare during speech, the runner-up's slots are computed exactly too, so a switch
+    to them in the last partial finds every slot exact; without the runner-up, the switch starts from nothing."""
+    first, runner = ("s1", "op", "v1"), ("s2", "op", "v2")
+
+    def run(alt):
+        clock = FakeClock()
+        be = SimBackend(clock, T, built=first + runner, page_pieces=8)      # a context: 3 x 8 x 20 ms
+        s = Scheduler(be, lambda text: runner if "late" in text else first, clock=clock,
+                      retrieve_alt=(lambda text: None if "late" in text else runner) if alt else None)
+        s.frame(0)
+        simulate(s, [])
+        clock.t = 10.0
+        ev = [(10.0, "key_down"), (10.1, "partial", "what time is"), (12.2, "partial", "what time is late"),
+              (12.3, "key_up"), (12.33, "final", "what time is late")]
+        simulate(s, ev)
+        return s, be
+
+    s, be = run(alt=True)
+    t = s.turns[-1]
+    assert t["plan"]["pages"] == runner and t["plan"]["frontier"] == 3 and not t["plan"]["missing"]
+    assert ("upgrade", runner, 0) in be.calls and t.get("frontier_found") == 3
+    assert limits_held(s) and classes_allowed(s)
+    s, be = run(alt=False)
+    assert s.turns[-1]["plan"]["frontier"] == 0      # the switch threw the exact work away
+
+
+def test_runner_up_waits_for_the_current_context_and_its_question():
+    """The runner-up is computed only after the current context is exact, and never instead of its question prefill."""
+    s, be, _ = make(retrieve=lambda text: ("a", "b"))
+    s.retrieve_alt = lambda text: ("a", "c")
+    simulate(s, turn(up=2.5, silent=None))
+    calls = [c for c in be.calls if c[0] in ("upgrade", "spec")]
+    first_alt = next(i for i, c in enumerate(calls) if c[0] == "upgrade" and c[1] == ("a", "c"))
+    assert ("upgrade", ("a", "b"), 1) in calls[:first_alt] and any(c[0] == "spec" for c in calls[:first_alt])
+    assert s.turns[-1]["plan"]["frontier"] == 2
+
+
+def test_retrieval_runs_in_pieces_and_takes_the_newest_partial():
+    """M3 (2026-11-15): retrieval is a job of GPU pieces, not a blocking call in partial(). Partials that arrive while
+    one runs aren't retrieved; the newest is, next. The final transcript is still retrieved before the answer."""
+    clock = FakeClock()
+    be = SimBackend(clock, {**T, "rq": .03}, built=("a", "b", "c"))
+    asked = []
+
+    def pages(text):
+        return ("a", "b") if "price" in text else ("a", "c")
+
+    def steps(text):
+        for _ in range(3):
+            yield "rq"
+            clock.t += .03
+        asked.append(text)
+        return pages(text), None
+
+    s = Scheduler(be, pages, clock=clock, retrieve_steps=steps)
+    s.frame(0)
+    simulate(s, [])
+    clock.t = 10.0
+    ev = [(10.0, "key_down"), (10.30, "partial", "what"), (10.32, "partial", "what was"),
+          (10.34, "partial", "what was the"), (10.36, "partial", "what was the price"),
+          (11.5, "key_up"), (11.53, "final", "what was the price")]
+    simulate(s, ev)
+    assert asked == ["what", "what was the price"]
+    assert s.turns[-1]["plan"]["pages"] == ("a", "b") and limits_held(s) and classes_allowed(s)
+    assert any(k.endswith(":rq") for k in s.turns[-1]["pieces"])
+
+
+def test_page_build_continues_in_tail_when_the_question_prefill_cannot_run():
+    """M3 (2026-11-15): with no stored pieces for the pages, the question prefill can't run in TAIL; building the
+    pages then is the only useful work, so it isn't frozen. With stored pieces, TAIL still prefers the prefill."""
+    s, be, _ = make(retrieve=lambda text: ("x", "y"), built=(), page_pieces=8)
+    be.buildable = lambda page: False           # like a kept screen or its view: no stored piece can be made
+    simulate(s, turn(up=1.2, silent=0.35, partials=((0.3, None),)))
+    t = s.turns[-1]
+    assert t["plan"]["frontier"] == 2 and limits_held(s) and classes_allowed(s)
+    assert t["pieces"].get("TAIL:IMPROVING:page_layer", 0) > 0
+
+
+def test_retrieval_waiting_on_the_disk_lets_page_work_run():
+    """M3 (2026-11-15): while a retrieval's next piece waits for keys to come off the disk, the job isn't runnable
+    (it would otherwise hold the GPU loop: other work runs meanwhile), and it runs once the read is in. (The fake
+    clock jumps to the next event when nothing can run, so the read is seen as done only at the next event.)"""
+    clock = FakeClock()
+    be = SimBackend(clock, {**T, "rq": .005}, built=("a", "b", "c"), page_pieces=8)
+    io = {"done_at": 10.5}
+    be.retrieval_ready = lambda: clock.t >= io["done_at"]
+    asked = []
+
+    def steps(text):
+        yield "rq"
+        clock.t += .005
+        asked.append(text)
+        return ("a", "b"), None
+
+    s = Scheduler(be, lambda text: ("a", "b"), clock=clock, retrieve_steps=steps)
+    s.frame(0)
+    simulate(s, [])
+    clock.t = 10.0
+    simulate(s, [(10.0, "key_down"), (10.05, "partial", "what"), (10.06, "partial", "what was the price"),
+                 (11.5, "key_up"), (11.53, "final", "what was the price")])
+    assert asked == ["what", "what was the price"] and limits_held(s) and classes_allowed(s)
+    rq_t = [t0 for t0, _, _, _, kind, _ in s.log if kind == "rq"]
+    assert rq_t and min(rq_t) >= 10.5                       # not before its read was in
+
+
+def test_one_slow_piece_does_not_hold_its_kind_back_for_good():
+    """M3 (2026-11-15): one outlier doesn't move the estimate; repeated slow pieces push it over the limit, and then
+    the kind is retried after losing BLOCKS_TO_FORGET picks (it can't be re-measured otherwise)."""
+    from scheduler import Estimates
+    e = Estimates({"rs": 0.005})
+    e.update("rs", 0.19)
+    assert e.get("rs") == 0.005                      # one outlier: the lower median of prior and sample
+    e.update("rs", 0.06)
+    assert e.get("rs") == 0.06                       # two of three slow: over a 50 ms limit
+    for _ in range(Estimates.BLOCKS_TO_FORGET):
+        e.blocked("rs")
+    assert e.get("rs") == 0.005                      # the largest forgotten: it runs again and is re-measured
+    e.update("rs", 0.004)
+    assert e.get("rs") <= 0.005

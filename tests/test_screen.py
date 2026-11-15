@@ -48,7 +48,7 @@ def run_watcher(frames_at):
     state = {}
     while clk.t < 1012:
         clk.sleep(w.step(state))
-    return w.handed
+    return list(w.handed)
 
 
 def test_change_is_handed_over_after_it_settles():

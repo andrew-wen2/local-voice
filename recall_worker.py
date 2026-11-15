@@ -210,11 +210,15 @@ class RecallWorker(threading.Thread):
             getattr(s, name)(*args)
 
     def _turn_closed(self, turn: dict):
+        end = getattr(self.backend, "end_turn", None)
+        if end is not None:
+            end()
         io, self.io = self.io, None
         if io is None:
             return
         keep = ("release_s", "waited_for_read", "need_frame", "screen_at_up", "cancelled", "retrievals",
-                "page_changes", "pages_cut", "wasted_s", "gpu_s", "prefix_at_down", "error")
+                "page_changes", "pages_cut", "wasted_s", "gpu_s", "prefix_at_down", "error", "states", "pieces", "blocked",
+                "frontier_found", "page_log", "frontier_log", "frontier_at_up", "pages_at_up", "alt_ready_at_up", "job_errors")
         io.result.update({k: turn.get(k) for k in keep if k in turn})
         if turn.get("error") and self.sched.errors:
             io.result["traceback"] = self.sched.errors[-1][2]
@@ -222,7 +226,11 @@ class RecallWorker(threading.Thread):
         io.result.update(plan_frontier=p.get("frontier"), plan_question_reused=p.get("question_reused"),
                          plan_prefill=p.get("prefill"), plan_base_reused=p.get("base_reused"),
                          plan_missing=len(p.get("missing") or ()))
-        io.done.set()
+        th = io.tts_thread
+        if th is not None and th.is_alive():            # the answer is decoded; done once its audio is all out
+            threading.Thread(target=lambda: (th.join(120), io.done.set()), daemon=True, name="tts-wait").start()
+        else:
+            io.done.set()
 
     def _startup(self):
         if self.mlx_cache_gb is not None:
@@ -232,6 +240,7 @@ class RecallWorker(threading.Thread):
         if self.backend_factory is None:
             a.load()
             a.set_budget(self.budget)
+            self.startup["wired_gb"] = wire_weights()
         self.startup["gemma_load_s"] = round(time.perf_counter() - t0, 2)
         if self.tts is not None:
             t0 = time.perf_counter()
@@ -245,10 +254,11 @@ class RecallWorker(threading.Thread):
                                       trim_silence=self.trim, history_max_tokens=self.history_max_tokens,
                                       screen_store=self.screen_store))
         self.startup["anchors_s"] = round(time.perf_counter() - t0, 2)
-        self.sched = Scheduler(self.backend, self._retrieve, freshness=self.freshness)
+        self.sched = Scheduler(self.backend, self._retrieve, freshness=self.freshness, retrieve_alt=self._retrieve_alt,
+                               retrieve_steps=self._retrieve_steps)
         self.sched.on_turn = self._turn_closed
         tok = self.backend.a.tok if hasattr(self.backend, "a") else None
-        self._count = lru_cache(maxsize=4096)(
+        self._count = lru_cache(maxsize=512)(
             (lambda s: len(tok.encode(s, add_special_tokens=False))) if tok is not None else (lambda s: len(s.split())))
 
     def _retrieve(self, text: str) -> tuple:
@@ -257,31 +267,86 @@ class RecallWorker(threading.Thread):
         The page cap counts the timeline and the pages header, as eval/recall/rag_arm.py does; screens come on top
         of it, as in the reading test (§12.16). Cached by text for the turn: the final transcript is usually the
         last partial."""
-        if text in self._found:
-            return self._found[text]
+        if text not in self._found:
+            self._found[text] = self._find(text)
+        return self._found[text][0]
+
+    def _retrieve_alt(self, text: str):
+        """The runner-up context for this (partial) question: the next-best kept screen, with its own view as the
+        memory, laid out as _retrieve lays out the best one; None if there is none. The scheduler computes it while
+        the GPU would otherwise idle (M3, 2026-11-13)."""
+        if text not in self._found:
+            self._found[text] = self._find(text)
+        return self._found[text][1]
+
+    def _retrieve_steps(self, text: str):
+        """(best, runner-up) for a partial transcript, as GPU pieces the scheduler interleaves with page work (its
+        Retrieve job, M3 2026-11-15). Same result as _retrieve/_retrieve_alt, and fills the same cache."""
+        yield "rprep"
+        if text not in self._found:
+            self._found[text] = yield from self._find_steps(text)
+        return self._found[text]
+
+    def _find(self, text: str) -> tuple:
+        gen = self._find_steps(text)
+        try:
+            while True:
+                next(gen)
+        except StopIteration as e:
+            return e.value
+
+    def _find_steps(self, text: str):
         used = self._count(self.store.timeline() + "\n\n") + self._count(PAGES_HEAD + HINT)
+        steps = getattr(self.backend, "find_screens_steps", None)
         find = getattr(self.backend, "find_screens", None)
-        if find is None:                              # backends without kept screens (tests)
-            out = tuple(self.store.pick(text, self.cap, self._count, used=used))
-        else:
-            # §5.25 (Andrew, 2026-11-12): the memory text is the top kept screen's own view text, up to the same
-            # budget; whole pages only while no screen has been kept yet.
-            fids = find(text)
-            ss = getattr(self.backend, "ss", None)
-            if fids and ss is not None and ss.ready(fids[0]):
-                vk = self.store.set_view(fids[0], ss.screens[fids[0]])
+        if steps is None and find is None:            # backends without kept screens (tests)
+            return tuple(self.store.pick(text, self.cap, self._count, used=used)), None
+        # §5.25 (Andrew, 2026-11-12): the memory text is the top kept screen's own view text, up to the same
+        # budget; whole pages only while no screen has been kept yet.
+        fids = (yield from steps(text)) if steps is not None else find(text)
+        yield "rlay"
+        ss = getattr(self.backend, "ss", None)
+
+        def layout(fs):
+            if fs and ss is not None and ss.ready(fs[0]):
+                vk = self.store.set_view(fs[0], ss.screens[fs[0]])
                 mem = (self.store.view_slot(vk, self.cap - used, self._count),)
             else:
                 mem = tuple(self.store.pick(text, self.cap, self._count, used=used))
-            out = tuple((SCREEN, f) for f in fids) + ((OPENER,),) + mem
-        self._found[text] = out
-        return out
+            return tuple((SCREEN, f) for f in fs) + ((OPENER,),) + mem
+
+        out, alt = layout(fids), None
+        ranked = list(getattr(self.backend, "last_ranked", None) or [])
+        if len(fids) == 1 and ss is not None:            # one screen in the context (today's setting)
+            nxt = next((f for f in ranked if f not in fids and ss.ready(f)), None)
+            if nxt is not None:
+                alt = layout([nxt])
+        return out, alt
+
+
+WIRED_HEADROOM_GB = 0.25          # on top of the weights (the prefix); wired memory can't be reclaimed for other apps
+
+
+def wire_weights() -> float:
+    """Keep MLX's memory resident (M3, 2026-11-13). Background work in quiet time runs text layers 0-23 only, so for an
+    hour the KV-shared layers (24-41) are untouched and macOS paged them out: the first answer after an hour took
+    3-3.8 s to its first token instead of ~0.15 s. Wired up to the weights plus headroom (buffers allocated first, the
+    weights, are wired first), below the system's recommended working set. "No swapping of the assistant" (M3 bar).
+    Returns the limit in GB."""
+    info = mx.device_info()
+    want = mx.get_active_memory() + int(WIRED_HEADROOM_GB * 1e9)
+    limit = int(min(want, 0.9 * info.get("max_recommended_working_set_size", want)))
+    mx.set_wired_limit(limit)
+    return round(limit / 1e9, 2)
 
 
 class ScreenEncoder(threading.Thread):
-    """Encodes kept screens on the Neural Engine in quiet time (§5.12: background, low power) and hands them to the GPU
-    thread for keying. A frame's image is held only until it is encoded. Without a converted Neural Engine encoder for
-    the frame's size, the image itself is handed over and the GPU encodes it while keying."""
+    """Hands kept screens to the GPU thread for keying, in quiet time. Since 2026-11-13 (Andrew: memory under 4 GB) the
+    image itself is handed over and the GPU encodes it while keying, or reuses the current-screen read's features when
+    that frame was read: one image encoder instead of two (the Neural Engine copy's process held ~0.74 GB, mostly its 16
+    chunks' input/output buffers). With an `ane` given (experiments), kept screens are encoded on the Neural Engine
+    instead (§5.12: low power), one chunk at a time, waiting for quiet before each. A frame's image is held only until
+    it is encoded."""
 
     def __init__(self, adapter, screens, quiet: Callable[[], bool], on_ready: Callable[[int], None], ane=None):
         super().__init__(daemon=True, name="screen-encoder")
@@ -289,7 +354,7 @@ class ScreenEncoder(threading.Thread):
         self.cv = threading.Condition()
         self.q: list[tuple] = []
         self._stop = False
-        self.stats = {"encoded_ane": 0, "handed_to_gpu": 0, "errors": 0}
+        self.stats = {"encoded_ane": 0, "handed_to_gpu": 0, "errors": 0, "paused": 0}
 
     def submit(self, fid: int, image, meta: dict):
         with self.cv:
@@ -305,6 +370,26 @@ class ScreenEncoder(threading.Thread):
             self._stop = True
             self.cv.notify_all()
 
+    def _encode(self, pv):
+        """The Neural Engine encode, one chunk at a time, waiting for quiet before each (§6.1's rule, enforced per chunk
+        since M3, 2026-11-13): a turn needs the Neural Engine for speech recognition and Kokoro, and an encode that
+        had started before the talk key slowed the final transcription from ~70 ms to 300-850 ms. The hidden state
+        waits between chunks; nothing is redone. None if stopped."""
+        g = self.ane.encode_steps(pv)
+        while True:
+            with self.cv:
+                if not self.quiet():
+                    self.stats["paused"] += 1
+                while not self._stop and not self.quiet():
+                    self.cv.wait(0.05)
+                if self._stop:
+                    g.close()
+                    return None
+            try:
+                next(g)
+            except StopIteration as e:
+                return e.value
+
     def run(self):
         import numpy as np
         while True:
@@ -315,12 +400,14 @@ class ScreenEncoder(threading.Thread):
                     return
                 fid, image, meta = self.q.pop(0)
             tokens = None
+            if self._stop:
+                return
             if self.ane is not None:
                 try:
                     inp = self.a._inputs(image, self.a.screen_turn_prompt())
                     pv = np.asarray(inp["pixel_values"], dtype=np.float32)
                     if self.ane.has(pv.shape[2], pv.shape[3]):
-                        tokens = self.ane.encode(pv)
+                        tokens = self._encode(pv)
                 except Exception:                      # fall back to the GPU for this frame
                     self.stats["errors"] += 1
             if tokens is not None:

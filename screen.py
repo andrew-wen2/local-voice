@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -363,7 +364,7 @@ class ScreenWatcher(threading.Thread):
         self.cmask = None
         self.cstats = {"polls": 0, "animated_cells": 0}
         self.frame_id = 0
-        self.handed: list[dict] = []
+        self.handed: deque = deque(maxlen=256)          # the latest frames handed (memory stays flat)
         self._stop = threading.Event()
         self.last_sent: Optional[np.ndarray] = None
         self.mask = None

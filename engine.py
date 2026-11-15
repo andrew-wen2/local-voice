@@ -297,10 +297,17 @@ class GemmaAdapter:
                  skip_audio: bool = True, skip_shared: bool = True, stream_ple: bool = True,
                  fast_vision: bool = True, compile_vision: bool = True,
                  vision_kernel: bool = True, indexed_scales: bool = True,
-                 swap_weights: bool = False):
+                 swap_weights: bool = False, lean: bool = True):
         self.path = Path(path)
         self.instruction = instruction
         self.model = self.processor = None
+        # M3 (2026-11-13, Andrew: app + helpers <= 4.0 GB): no Hugging Face tokenizer or processor in the process
+        # (~0.30 GB). lean_tok.py's tokenizer (exact ids, ~40 MB), the chat template rendered once at build time, and
+        # the image processor alone. Built by `python -m lean_tok build` (a separate process); without those files,
+        # the processor path is used.
+        self.lean = lean
+        self.chat: Optional[dict] = None
+        self.image_processor = None
         # M1 (ARCHITECTURE.md §3.3): don't build Gemma's audio encoder (0.61 GB; Parakeet does speech).
         self.skip_audio = skip_audio
         # G1 (§4.2): during prefill, run the 18 KV-shared layers only for the last token. They store
@@ -325,10 +332,29 @@ class GemmaAdapter:
         self.swap_weights = swap_weights
 
     # -- setup
+    def _lean_files(self) -> bool:
+        from lean_tok import CHAT, FILE
+        if not ((self.path / FILE).exists() and (self.path / CHAT).exists()):
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, "-m", "lean_tok", "build", str(self.path)], check=True,
+                           cwd=Path(__file__).resolve().parent, capture_output=True)
+        return (self.path / FILE).exists() and (self.path / CHAT).exists()
+
     def load(self):
         from mlx_vlm import load
         lazy = self.stream_ple            # lazy: the PLE table must never be read into memory
-        if self.skip_audio:
+        lean = self.lean and self._lean_files()
+        if lean:
+            from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4ImageProcessor
+            from mlx_vlm.utils import load_model
+            if self.skip_audio:
+                with _audio_config_off():
+                    self.model = load_model(self.path, lazy)
+            else:
+                self.model = load_model(self.path, lazy)
+            self.image_processor = Gemma4ImageProcessor.from_pretrained(str(self.path))
+        elif self.skip_audio:
             with _audio_config_off():
                 self.model, self.processor = load(str(self.path), lazy=lazy)
         else:
@@ -359,7 +385,14 @@ class GemmaAdapter:
         if self.swap_weights:
             self._swap_init()
         self.lm = self.model.language_model
-        self.tok = self.processor.tokenizer
+        if lean:
+            import json
+            from lean_tok import CHAT, LeanTokenizer
+            self.tok = LeanTokenizer(self.path)
+            self.chat = json.loads((self.path / CHAT).read_text())
+        else:
+            self.tok = self.processor.tokenizer
+            self.image_processor = self.processor.image_processor
         vocab = self.tok.get_vocab()
         self.stop_ids = {self.tok.eos_token_id} | {
             self.tok.convert_tokens_to_ids(t) for t in ("<turn|>", "<end_of_turn>") if t in vocab}
@@ -386,14 +419,17 @@ class GemmaAdapter:
         return lambda h, pos, mask, rope=None: layer(h, pos, mask)
 
     def set_budget(self, n: int):
-        self.processor.image_processor.max_soft_tokens = n
+        self.image_processor.max_soft_tokens = n
         self.budget = n
 
     # -- prompt pieces
     def full_prompt(self, question: str) -> str:
+        content = f"{self.instruction}\n{SPLIT_MARKER} {question}"
+        chat = getattr(self, "chat", None)
+        if chat is not None:                            # the template is head + message.strip() + tail (lean_tok)
+            return chat["head"] + content.strip() + chat["tail"]
         from mlx_vlm.prompt_utils import apply_chat_template
-        return apply_chat_template(self.processor, self.model.config,
-                                   f"{self.instruction}\n{SPLIT_MARKER} {question}", num_images=1)
+        return apply_chat_template(self.processor, self.model.config, content, num_images=1)
 
     def prefix_prompt(self) -> str:
         p = self.full_prompt("x")
@@ -452,11 +488,11 @@ class GemmaAdapter:
         if not self.swap_weights:
             return
         self._use[part] += 1
-        if not self._resident[part]:
-            self._load_part(part)
         other = "head" if part == "vision" else "vision"
         if self._resident[other] and self._use[other] == 0:
-            self._unload_part(other)
+            self._unload_part(other)                    # first, so the two are never in memory together (M3)
+        if not self._resident[part]:
+            self._load_part(part)
 
     def _release(self, part: str):
         if not self.swap_weights:
@@ -468,8 +504,23 @@ class GemmaAdapter:
                 self._load_part("head")
 
     def _inputs(self, image, prompt: str):
+        if self.processor is None:
+            return self._inputs_lean(image, prompt)
         from mlx_vlm.utils import prepare_inputs
         return prepare_inputs(self.processor, images=[image], prompts=[prompt])
+
+    def _inputs_lean(self, image, prompt: str) -> dict:
+        """What the Gemma 4 processor returns for one image, without it: pixel values from the image processor, the
+        one <|image|> expanded to <|image> + n x <|image|> + <image|> (n = the image's soft tokens), tokenized, and
+        the image tokens marked (checked equal to prepare_inputs, tests/test_lean_tok.py)."""
+        ip = self.image_processor
+        data, nums = ip(ip.fetch_images([image]))
+        assert prompt.count("<|image|>") == 1, prompt
+        ids = np.array([self.tok.encode(prompt.replace("<|image|>", "<|image>" + "<|image|>" * int(nums[0]) + "<image|>"))],
+                       dtype=np.int64)
+        return {"input_ids": mx.array(ids), "attention_mask": mx.array(np.ones_like(ids)),
+                "mm_token_type_ids": mx.array((ids == self.tok.special["<|image|>"]).astype(np.int64)),
+                "pixel_values": mx.array(np.asarray(data["pixel_values"], dtype=np.float32))}
 
     @_uses("vision")
     def _prefill(self, inp, upto: Optional[int] = None):
@@ -502,11 +553,17 @@ class GemmaAdapter:
                  on_first_token: Optional[Callable[[], None]] = None) -> Iterator[str]:
         """Greedy decode after feeding `ids` into `cache` (mutated). Yields text deltas.
         Stops at a stop token, `max_sentences` sentence ends, `max_tokens`, or `cancel`.
-        Sets self.last_stop to 'eos' | 'sentences' | 'cap' | 'cancel'."""
+        Sets self.last_stop to 'eos' | 'sentences' | 'cap' | 'cancel'.
+        Pipelined (M3, 2026-11-15): the next token's forward pass is queued on the GPU before this token's CPU work
+        (detokenizing, the stop checks, the caller's phrase logic, other pieces in between), so that work hides
+        behind the GPU instead of adding to every token. Same tokens (greedy, same graph); the cache ends one token
+        past the stop (callers clone it or drop it)."""
         self.last_stop = None
         y = mx.argmax(self.lm(inputs=mx.array([ids]), cache=cache).logits[:, -1, :], axis=-1)
         out, text = [], ""
         while True:
+            nxt = mx.argmax(self.lm(inputs=y[None], cache=cache).logits[:, -1, :], axis=-1)
+            mx.async_eval(nxt)
             t = int(y.item())
             if not out and on_first_token:
                 on_first_token()
@@ -527,7 +584,7 @@ class GemmaAdapter:
             if cancel is not None and cancel.is_set():
                 self.last_stop = "cancel"
                 return
-            y = mx.argmax(self.lm(inputs=y[None], cache=cache).logits[:, -1, :], axis=-1)
+            y = nxt
 
     # -- context pieces (conversation history, ARCHITECTURE.md §9). Every piece runs text layers
     # 0-23 only (layers 24-41 share KV and store nothing) and yields once per piece.
@@ -556,9 +613,9 @@ class GemmaAdapter:
             return self.text_ids(f" {q}{TURN_END}{TURN_MODEL}{a}{TURN_END}")
         return self.text_ids(f"{TURN_USER}{self.EARLIER if older else ''}{q}{TURN_END}{TURN_MODEL}{a}{TURN_END}")
 
-    def _layer_steps(self, cache, h, pli, mm, layers_per_piece: int):
+    def _layer_steps(self, cache, h, pli, mm, layers_per_piece: int, n_layers: Optional[int] = None):
         tm = self.lm.model
-        n_text = tm.first_kv_shared_layer_idx
+        n_text = tm.first_kv_shared_layer_idx if n_layers is None else min(n_layers, tm.first_kv_shared_layer_idx)
         if tm.hidden_size_per_layer_input and pli is not None:
             pli = tm.project_per_layer_inputs(h, pli)
         masks = tm._make_masks(h, cache + [None] * (len(tm.layers) - len(cache)), mm)
@@ -571,13 +628,14 @@ class GemmaAdapter:
             mx.eval(h, [c.state for c in cache[start:end]])
             yield None
 
-    def prefill_text_steps(self, cache, ids: list[int], layers_per_piece: int = 2):
-        """Append text tokens to `cache` (mutated). Generator; returns the cache."""
+    def prefill_text_steps(self, cache, ids: list[int], layers_per_piece: int = 2, n_layers: Optional[int] = None):
+        """Append text tokens to `cache` (mutated). Generator; returns the cache. `n_layers`: stop after the first
+        n text layers (the rest of the cache stays empty; for reading early layers' queries, not for answering)."""
         tm = self.lm.model
         x = mx.array([ids])
         h = tm.embed_tokens(x) * tm.embed_scale
         pli = tm.get_per_layer_inputs(x) if tm.hidden_size_per_layer_input else None
-        yield from self._layer_steps(cache, h, pli, None, layers_per_piece)
+        yield from self._layer_steps(cache, h, pli, None, layers_per_piece, n_layers)
         return cache
 
     def new_prefix_steps(self, exchanges, layers_per_piece: int = 2):
@@ -847,6 +905,7 @@ class AneTts:
         self.sample_rate = 24000
         self.startup: dict = {}
         self.failures: list[dict] = []
+        self._req = threading.Lock()                    # one request at a time (TTS runs on its own thread, M3)
 
     def available(self) -> bool:
         return self.binary.exists() and (self.model_dir / "kokoro-82m-coreml").exists()
@@ -902,7 +961,7 @@ class AneTts:
         return raw, r
 
     def synth(self, sentence: str, cancel: Optional[threading.Event] = None, trim: bool = True,
-              tail_keep_ms: float = 120) -> Iterator[np.ndarray]:
+              tail_keep_ms: float = 120, lead_keep_ms: float = 30) -> Iterator[np.ndarray]:
         """Yields the sentence's audio as one chunk (leading and trailing silence trimmed). Never raises for a helper failure:
         a dead helper is restarted and the text retried once; if that fails too, this text is skipped (no audio)
         and the failure counted in self.failures, so one bad sentence can't stop the GPU worker."""
@@ -911,25 +970,27 @@ class AneTts:
         text = " ".join(sentence.split())               # one line per request
         if not text:
             return
-        raw, r = self._request(text)
-        if raw is None and "error" in r:
-            self.failures.append({"text": text, "error": r["error"]})
-            try:
-                self.stop()
-                self.load()
-                raw, r = self._request(text)
-            except Exception as e:                      # couldn't restart: skip this text
-                r = {"error": repr(e)}
-            if raw is None:
-                self.failures[-1]["retry_error"] = r.get("error")
-                return
+        with self._req:
+            raw, r = self._request(text)
+            if raw is None and "error" in r:
+                self.failures.append({"text": text, "error": r["error"]})
+                try:
+                    self.stop()
+                    self.load()
+                    raw, r = self._request(text)
+                except Exception as e:                  # couldn't restart: skip this text
+                    r = {"error": repr(e)}
+                if raw is None:
+                    self.failures[-1]["retry_error"] = r.get("error")
+                    return
         if raw is None:
             return
+        self.last_seconds = r.get("seconds")               # the helper's own synthesis time
         a = np.frombuffer(raw, dtype="<f4").astype(np.float32)
         if cancel is not None and cancel.is_set():
             return
         if trim:
-            a = trim_silence(a, self.sample_rate, lead_keep_ms=30, tail_keep_ms=tail_keep_ms)
+            a = trim_silence(a, self.sample_rate, lead_keep_ms=lead_keep_ms, tail_keep_ms=tail_keep_ms)
         yield a
 
     def stop(self):

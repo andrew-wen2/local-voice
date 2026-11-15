@@ -14,6 +14,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -32,6 +33,7 @@ from screen_store import ScreenStore
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
 WARM_WAV = ROOT / "harness/questions/v01.wav"
+WARM_Q = "What's on my screen right now?"
 
 
 class RecallApp:
@@ -39,7 +41,7 @@ class RecallApp:
                  windows_fn: Callable[[], list] = windows, clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep, budget: int = 1120, swap_weights: bool = True,
                  freshness: str = "B", first_chunk: str = "phrase", trim_silence: bool = True,
-                 mlx_cache_gb: Optional[float] = 0.0, use_ane: bool = True, log_path: Optional[Path] = None,
+                 mlx_cache_gb: Optional[float] = 0.0, use_ane: bool = False, log_path: Optional[Path] = None,
                  show_text: bool = False, on_row: Optional[Callable[[dict], None]] = None, monitor: bool = True):
         self.grab_screen, self.grab_small, self.windows_fn = grab, grab_small, windows_fn
         self.clock, self.sleep = clock, sleep
@@ -53,7 +55,7 @@ class RecallApp:
         self.before: dict = {}
         self.turn: dict = {}
         self.seq = 0
-        self.rows: list[dict] = []
+        self.rows: deque = deque(maxlen=100)            # the latest turns (all of them are in the log file)
         self.startup: dict = {}
 
     # ------------------------------------------------------------ start / stop
@@ -77,8 +79,8 @@ class RecallApp:
         self.worker.ready.wait()
         if self.worker.error:
             raise self.worker.error
-        if self.use_ane:
-            try:                                         # kept screens are encoded on the Neural Engine when it can
+        if self.use_ane:            # off (Andrew, 2026-11-13): the Neural Engine copy held ~0.74 GB; kept screens use the GPU
+            try:
                 from ane_vision import OUT, AneProcess
                 self.ane = AneProcess(OUT).load()
             except Exception as e:
@@ -102,8 +104,24 @@ class RecallApp:
         self.watcher.last_sent = np.asarray(first)
         self.watcher.last_sent_small = self.grab_small() if self.grab_small else scr.shrink(first)
         self.watcher.start()
-        self.startup = {**self.worker.startup, "ready_s": round(time.perf_counter() - t_all, 1)}
+        self.startup = {**self.worker.startup, "warmup_s": self._warm_up(),
+                        "ready_s": round(time.perf_counter() - t_all, 1)}
         return self.startup
+
+    def _warm_up(self) -> float:
+        """One silent question through the answer path (retrieval, assembly, prefill, decode, Kokoro) before the first
+        real one, so first-use costs are paid at startup (M3, 2026-11-13). Its audio is dropped; it isn't kept in the
+        conversation. Returns seconds."""
+        t = time.perf_counter()
+        io = TurnIO(emit_audio=lambda samples, sr: None, mark=lambda name: None, warmup=True)
+        io.question = WARM_Q
+        self.worker.key_down()
+        self.worker.partial(WARM_Q)
+        self.worker.key_up(io)
+        self.worker.final(WARM_Q)
+        io.done.wait(120)
+        self.worker.turn_active = False
+        return round(time.perf_counter() - t, 1)
 
     def _pids(self) -> dict:
         ane_proc = getattr(self.ane, "proc", None)

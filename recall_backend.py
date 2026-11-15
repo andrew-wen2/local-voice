@@ -15,9 +15,10 @@ is not measured yet.
 
 Stored page pieces (graph, §3.11): a page is computed after the stored pieces of its K_PARENTS most similar pages
 first seen before it (the retriever's BM25, the page's title and text as the query), loaded and re-rotated, after
-the anchor <bos> <|turn>user\\n pages header. Its full-attention entries stay in memory (16 KB a token); its last W
-window entries, needed only when it is a parent in a later build, go to a private folder on disk and are deleted
-when the app quits. A page's piece is rebuilt when its version changes (a visit of it ended: its text and time
+the anchor <bos> <|turn>user\\n pages header. The piece (full-attention entries, 16 KB a token, and its last W window
+entries, needed only when it is a parent in a later build) goes to a private folder on disk, deleted when the app
+quits; memory holds only its token ids and parents, so memory doesn't grow with the hour (Andrew, 2026-11-13). A
+question loads the pieces its context uses, bounded by the context cap. A page's piece is rebuilt when its version changes (a visit of it ended: its text and time
 header changed).
 
 Kept screens (visual memory, §5.12): retrieved past screens come first after the prefix, each as its own user turn
@@ -34,6 +35,7 @@ kinds are named by size ("L1x512"), and `prior` gives their first estimate from 
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import tempfile
 import threading
@@ -52,6 +54,14 @@ from engine import TURN_END, TURN_USER, clone_cache, split_complete_sentences, s
 from recall import HINT, PAGES_HEAD
 from screen_store import KEY_LAYERS, Screen, quantize_int8
 
+IMAGE = "<|image|>"
+# The first phrase goes to Kokoro at a natural break once 5 words are in (it was 7), at least 3 in the phrase (was 4):
+# ~2 fewer tokens to decode and a shorter first synthesis (Kokoro 65-100 ms for 3-4 words, idle Neural Engine,
+# measured 2026-11-13), with the seam still at punctuation or before a break word ("is", "that", "in", ...).
+FIRST_MIN_WORDS, FIRST_MAX_WORDS = 3, 5
+READ_FEATS = 4                   # image features of the last reads kept for keying (~5.5 MB each)
+MAX_BRANCHES = 2                 # exact caches kept: the current context and the runner-up (~0.1 GB each, estimate)
+
 SCREEN, OPENER, KEY = "§screen", "§opener", "§key"
 KEPT_HEAD = "(Earlier screen from {time}, no longer on screen) {title}"       # a kept screen's label
 NULL_Q = "N/A"                    # ICR's content-free query (§12.17)
@@ -65,7 +75,8 @@ VISION_KINDS = ["prep", "patch"] + ["vision"] * 16 + ["pool"]
 PRIORS = {                    # seconds; S0 (§5.8) for the read, estimates for the rest
     "prep": 0.061, "patch": 0.088, "vision": 0.080, "pool": 0.010, "embed": 0.008, "text": 0.042,
     "check": 0.0005, "plan_build": 0.010, "assemble": 0.015, "answer_prefill": 0.060, "decode": 0.026,
-    "text1": 0.021, "screen_prep": 0.065,
+    "text1": 0.021, "screen_prep": 0.004, "append": 0.030,     # features from disk + the cached token layout (2-3 ms measured, 2026-11-13)
+    "rq": 0.006, "rs": 0.005, "rprep": 0.002, "rlay": 0.003,  # retrieval pieces: 3 layers, 32 screens (M3, 2026-11-15)
 }
 
 
@@ -87,6 +98,11 @@ def _sdpa(queries, keys, values, cache=None, scale=1.0, mask=None, **kw):
 
 
 _GL.scaled_dot_product_attention = _sdpa
+
+
+QUERY_LAYERS = 3                    # text layers a piece in the retrieval's question pass (~5 ms standalone, fits TAIL)
+KEY_CHUNK = 32                      # kept screens a key-scoring piece
+_dequant = mx.compile(lambda k8, ks: k8.astype(mx.float16) * ks)
 
 
 def steps(gen, kinds):
@@ -137,6 +153,8 @@ class TurnIO:
     cancel: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
+    tts_thread: Optional[threading.Thread] = None       # speaks the answer's chunks; `done` waits for it
+    warmup: bool = False                                # a startup warm-up: not kept in the conversation
 
 
 class RecallBackend:
@@ -145,9 +163,11 @@ class RecallBackend:
                  screen_store=None, n_screens: int = 1):           # Andrew, 2026-11-11 (§5.13)
         self.a, self.store, self.tts = adapter, store, tts
         self.ss, self.n_screens = screen_store, n_screens
-        self._tpl: dict = {}                            # (size, text) -> processor inputs for a blank image
+        from concurrent.futures import ThreadPoolExecutor
+        self._io = ThreadPoolExecutor(1, thread_name_prefix="key-reads")   # retrieval's key reads, off the GPU loop
+        self._pending_io = None
+        self._tpl: dict = {}                            # (size, budget) -> the image's token block (ids, types, mask)
         self._null: dict = {}                           # screen-turn length -> null-query vectors per layer
-        self._stack = None                              # (store version, fids, {layer: (int8, scales, nulls)})
         self.lay = K.Layout(adapter)
         self.first_chunk, self.trim = first_chunk, trim_silence
         self.history_max_tokens, self.k_parents = history_max_tokens, k_parents
@@ -155,23 +175,28 @@ class RecallBackend:
         self.frames: dict[int, object] = {}             # frame id -> image, set by the worker before frame()
         self.frames_lock = threading.Lock()
         self.screens: dict[int, K.Piece] = {}           # frame id -> stored screen piece (newest two kept)
-        self.pieces: dict[str, dict] = {}               # page key -> {version, ids, piece, parents, cuts}
+        self.read_feats: dict[int, mx.array] = {}       # frame id -> image features of the newest reads (READ_FEATS)
+        self.pieces: dict[str, dict] = {}               # page key -> {version, ids, path, parents, cuts: {lines: path}}
         self.history: list[tuple[str, str]] = []        # finished exchanges (question, answer)
         self.prefix_v = 0                               # matches the scheduler's prefix version
         self.prefix_cache = None
         self.prefix_n = 0                               # exchanges in the prefix
         self.hist_end = None                            # (offset, window snapshot) before the pages turn opens
-        self.exact = None                               # exact cache: prefix + pages, built by upgrade()
-        self.exact_v = -1
-        self.exact_slots: tuple = ()
-        self.bounds: list[tuple[int, dict]] = []        # (offset, window snapshot) where each exact page starts
-        self.base = None                                # (key, cache): the assembled context before the question
-        self.spec_state = None                                # {"key", "ids", "cov", "cache"}
+        # Exact caches (prefix + slots computed in order), built by upgrade(): the current context's and, while the GPU
+        # would otherwise idle during speech, the runner-up's (M3, 2026-11-13), so a late switch finds it ready. Each:
+        # {"cache", "slots", "bounds": [(offset, window snapshot) where each slot starts], "busy"}; most recent first,
+        # at most MAX_BRANCHES, all on prefix version branch_v.
+        self.branches: list[dict] = []
+        self.branch_v = -1
+        # The assembled context for the current key, with the question so far prefilled into it in place (M3,
+        # 2026-11-13: no second copy for the question): {"key", "cache", "end": (offset, window snapshot) where the
+        # context ends, "ids", "cov": question tokens in the cache, "dirty": a prefill was cut short}.
+        self.base: Optional[dict] = None
         self.io: Optional[TurnIO] = None
-        self.stats = {"builds": 0, "build_s": 0.0, "build_tokens": 0, "cut_pieces": 0, "window_bytes_on_disk": 0}
+        self.stats = {"builds": 0, "build_s": 0.0, "build_tokens": 0, "cut_pieces": 0, "piece_bytes_on_disk": 0}
         self.dir = Path(piece_dir) if piece_dir else Path(tempfile.mkdtemp(prefix="lv-pieces-"))
         os.chmod(self.dir, 0o700)
-        self._ids = lru_cache(maxsize=4096)(lambda s: tuple(self.a.text_ids(s)))
+        self._ids = lru_cache(maxsize=256)(lambda s: tuple(self.a.text_ids(s)))     # bounded: memory stays flat
         a = self.a
         self.page_anchor = self._run(self._prefill(a.model.make_cache(), [a.tok.bos_token_id] +
                                                    list(self._ids(TURN_USER + HEAD))))
@@ -217,24 +242,41 @@ class RecallBackend:
         key, _, n_lines = slot
         return self._ids(self.store.page_text(key, n_lines))
 
-    def _window_path(self, key: str) -> Path:
-        return self.dir / f"{abs(hash(key))}.safetensors"
+    def _save_piece(self, name: str, piece: K.Piece) -> Path:
+        """A piece (full-layer entries, and window entries if it has them) to the private folder."""
+        arrays = {f"f.{i}.{j}": x for i, kv in piece.full.items() for j, x in enumerate(kv)}
+        arrays.update({f"w.{i}.{j}": x for i, kv in (piece.window or {}).items() for j, x in enumerate(kv)})
+        path = self.dir / f"{abs(hash(name))}.safetensors"
+        old = path.stat().st_size if path.exists() else 0
+        mx.save_safetensors(str(path), arrays, metadata={"n": str(piece.n), "pos": str(piece.pos)})
+        os.chmod(path, 0o600)
+        self.stats["piece_bytes_on_disk"] += path.stat().st_size - old
+        return path
 
-    def _save_window(self, key: str, piece: K.Piece):
-        arrays = {f"{i}.{j}": x for i, kv in piece.window.items() for j, x in enumerate(kv)}
-        mx.save_safetensors(str(self._window_path(key)), arrays)
-        os.chmod(self._window_path(key), 0o600)
-        self.stats["window_bytes_on_disk"] = sum(f.stat().st_size for f in self.dir.iterdir())
+    def _load_piece(self, path: Path, window: bool) -> K.Piece:
+        arrays, meta = mx.load(str(path), return_metadata=True)
+        full, win = {}, {}
+        for name, x in arrays.items():
+            part, i, j = name.split(".")
+            if part == "f" or window:
+                (full if part == "f" else win).setdefault(int(i), [None, None])[int(j)] = x
+        return K.Piece(int(meta["n"]), int(meta["pos"]), {i: tuple(kv) for i, kv in full.items()},
+                       {i: tuple(kv) for i, kv in win.items()} if window else None)
 
     def _with_window(self, key: str) -> K.Piece:
-        e = self.pieces[key]
-        arrays = mx.load(str(self._window_path(key)))
-        win = {}
-        for name, x in arrays.items():
-            i, j = map(int, name.split("."))
-            win.setdefault(i, [None, None])[j] = x
-        p = e["piece"]
-        return K.Piece(p.n, p.pos, p.full, {i: tuple(kv) for i, kv in win.items()})
+        return self._load_piece(self.pieces[key]["path"], window=True)
+
+    def _forget(self, key: str):
+        """Drop a page's stored piece and its cuts (a view whose screen expired)."""
+        e = self.pieces.pop(key, None)
+        for path in ([e["path"]] + list(e["cuts"].values())) if e else []:
+            if path.exists():
+                self.stats["piece_bytes_on_disk"] -= path.stat().st_size
+                path.unlink()
+
+    @staticmethod
+    def _is_prefix(ids, stored: np.ndarray) -> bool:
+        return len(ids) <= len(stored) and np.array_equal(np.asarray(ids, dtype=np.int32), stored[:len(ids)])
 
     # ------------------------------------------------------------ what the scheduler asks
 
@@ -253,20 +295,20 @@ class RecallBackend:
             return False
         if n_lines in e["cuts"]:
             return True
-        ids = self.page_ids(slot)
-        return ids == e["ids"][:len(ids)]
+        return self._is_prefix(self.page_ids(slot), e["ids"])
 
     def piece(self, slot) -> K.Piece:
         key, _, n_lines = slot
         e = self.pieces[key]
         if n_lines in e["cuts"]:
-            return e["cuts"][n_lines]
+            return self._load_piece(e["cuts"][n_lines], window=False)
         ids = self.page_ids(slot)
-        assert ids == e["ids"][:len(ids)]
-        return e["piece"] if len(ids) == len(e["ids"]) else e["piece"].head(len(ids))
+        assert self._is_prefix(ids, e["ids"])
+        p = self._load_piece(e["path"], window=False)
+        return p if len(ids) == len(e["ids"]) else p.head(len(ids))
 
     def prefetch(self, slots):
-        pass                                            # full-layer entries stay in memory
+        pass                                            # pieces load from disk when a context is assembled
 
     def read(self, fid: int):
         with self.frames_lock:
@@ -276,8 +318,12 @@ class RecallBackend:
 
         def g():
             enc = yield from steps(self.a.encode_steps(img), VISION_KINDS)
-            c, _ = yield from steps(self.a.screen_steps(self.screen_anchor, enc, layers_per_piece=2),
-                                    ["embed"] + ["text"] * (-(-self.lay.n // 2)))
+            self.read_feats[fid] = enc[1]               # a kept frame that was read is keyed from these, not re-encoded
+            for f in sorted(self.read_feats)[:-READ_FEATS]:
+                del self.read_feats[f]
+            # one text layer a piece: half the temporary memory of two (the read's peak, M3 2026-11-13)
+            c, _ = yield from steps(self.a.screen_steps(self.screen_anchor, enc, layers_per_piece=1),
+                                    ["embed"] + ["text1"] * self.lay.n)
             self.screens[fid] = K.take(self.lay, c, self.screen_pos, window=True)
             for f in sorted(self.screens)[:-2]:
                 del self.screens[f]
@@ -313,9 +359,11 @@ class RecallBackend:
                 ids = self.page_ids(whole)
                 c = yield from self._prefill(c, ids)
                 piece = K.take(self.lay, c, pos, window=True)
-                self._save_window(key, piece)
-                piece.window = None
-                self.pieces[key] = e = {"version": v, "ids": ids, "piece": piece, "parents": parent_keys, "cuts": {}}
+                if key in self.pieces:                  # the old version and its cuts (same name: overwritten)
+                    self._forget(key)
+                self.pieces[key] = e = {"version": v, "ids": np.asarray(ids, dtype=np.int32),
+                                        "path": self._save_piece(key, piece), "parents": parent_keys, "cuts": {}}
+                del piece
                 self.stats["builds"] += 1
                 self.stats["build_s"] += time.perf_counter() - t0
                 self.stats["build_tokens"] += len(ids)
@@ -326,7 +374,7 @@ class RecallBackend:
                                                           if u in self.pieces])
                 pos = int(c[0].offset)
                 c = yield from self._prefill(c, self.page_ids(cut_slot))
-                e["cuts"][cut_slot[2]] = K.take(self.lay, c, pos, window=False)
+                e["cuts"][cut_slot[2]] = self._save_piece(f"{key}#{cut_slot[2]}", K.take(self.lay, c, pos, window=False))
                 self.stats["cut_pieces"] += 1
                 del c
         return g()
@@ -334,17 +382,26 @@ class RecallBackend:
     # ------------------------------------------------------------ kept screens (§5.12)
 
     def _inputs_like(self, size, text: str) -> dict:
-        """Processor inputs for `text` (with one "<|image|>") as if the image were `size`: run on a blank image of that
-        size, so the token ids are exactly those of a real frame; the pixels are dropped (features come from storage)."""
-        key = (tuple(size), text)
+        """Processor inputs for `text` (with one "<|image|>") as if the image were `size`; the pixels are left out
+        (features come from storage). The image's token block depends only on the size (and the budget), so the
+        processor runs once per size, on a blank image; the text around it is tokenized on its own, which gives the
+        processor's exact ids because "<|image|>" is a special token (nothing merges across it). Running the processor
+        per screen took ~65-77 ms, over the 50 ms piece limit while you speak (M3, 2026-11-13)."""
+        key = (tuple(size), getattr(self.a, "budget", None))
         if key not in self._tpl:
             from PIL import Image
-            inp = dict(self.a._inputs(Image.new("RGB", tuple(size)), text))
-            inp["pixel_values"] = mx.zeros((1,), dtype=mx.float16)      # a placeholder: features are given
-            self._tpl[key] = inp
-            if len(self._tpl) > 256:
-                self._tpl.pop(next(iter(self._tpl)))
-        return self._tpl[key]
+            inp = self.a._inputs(Image.new("RGB", tuple(size)), IMAGE)
+            self._tpl[key] = {k: np.asarray(v) for k, v in inp.items() if k != "pixel_values"}
+        blk = self._tpl[key]
+        before, after = text.split(IMAGE)
+        a, b = (np.asarray([self.a.text_ids(t)], dtype=blk["input_ids"].dtype) for t in (before, after))
+        out = {}
+        for k, v in blk.items():
+            fill = 1 if k == "attention_mask" else 0                     # text tokens: attended, not image
+            out[k] = mx.array(np.concatenate([np.full_like(a, fill, dtype=v.dtype), v, np.full_like(b, fill, dtype=v.dtype)]
+                                             if k != "input_ids" else [a, v, b], axis=1))
+        out["pixel_values"] = mx.zeros((1,), dtype=mx.float16)          # a placeholder: features are given
+        return out
 
     def _turn_text(self, s: Screen) -> str:
         """A kept screen's turn: a closed user turn, before the pages."""
@@ -360,40 +417,57 @@ class RecallBackend:
             s = self.ss.screens[fid]
         inp = self._inputs_like(s.size, self._turn_text(s))
         feats = mx.array(self.ss.load_features(fid))
-        out, _ = yield from steps(self.a.screen_steps(c, (inp, feats), layers_per_piece=2),
-                                  ["embed"] + ["text"] * (-(-self.lay.n // 2)))
+        # One text layer a piece (~22 ms): two-layer pieces took ~42-45 ms, so close to the 50 ms limit while you speak
+        # that their estimate drifted over it and they stopped running during speech (M3, 2026-11-13).
+        out, _ = yield from steps(self.a.screen_steps(c, (inp, feats), layers_per_piece=1),
+                                  ["embed"] + ["text1"] * self.lay.n)
         return out
 
     def _queries(self, text: str, T: int) -> dict:
+        return self._run(self._queries_steps(text, T))
+
+    def _queries_steps(self, text: str, T: int):
         """The question's queries at KEY_LAYERS (post-RoPE, as attention sees them), re-rotated to sit right after a
-        screen turn of T tokens, as in §12.17's measurement. {layer: (queries [heads, Lq, D] float16, scale)}."""
+        screen turn of T tokens, as in §12.17's measurement. {layer: (queries [heads, Lq, D] float16, scale)}.
+        Generator in pieces of QUERY_LAYERS text layers ("rq"). Only the layers up to the last key layer run: the
+        queries there don't depend on later layers (M3, 2026-11-15: 18 of 24 layers, same values). The capture is
+        on only during this pass's own pieces, so pieces of other jobs in between aren't captured."""
         ids = [self.a.tok.bos_token_id] + list(self._ids(" " + text))
-        _CAPTURE["on"], _CAPTURE["calls"] = True, []
-        try:
-            self._run(self.a.prefill_text_steps(self.a.model.make_cache(), ids, layers_per_piece=self.lay.n))
-        finally:
-            _CAPTURE["on"] = False
+        top = max(KEY_LAYERS) + 1
+        gen = self.a.prefill_text_steps(self.a.model.make_cache(), ids, layers_per_piece=QUERY_LAYERS, n_layers=top)
+        calls: list = []
+        for _ in range(-(-top // QUERY_LAYERS)):
+            yield "rq"
+            _CAPTURE["on"], _CAPTURE["calls"] = True, calls
+            try:
+                next(gen)
+            finally:
+                _CAPTURE["on"], _CAPTURE["calls"] = False, []
+        gen.close()
         out = {}
         for L in KEY_LAYERS:
-            q, scale = _CAPTURE["calls"][L]
+            q, scale = calls[L]
             q = K.rotate(self.lay.ropes[L], q[:, :, 1:, :], T - 1)
             out[L] = (q[0].astype(mx.float16), float(scale))
-        _CAPTURE["calls"] = []
         return out
 
     @staticmethod
     def _score(q, scale, k8, ks) -> mx.array:
         """Mean over question tokens and query heads of the max over image tokens of q.k * scale, for a batch of
-        frames' int8 keys [n, kv heads, n_img, D] with scales [n, kv heads, n_img, 1]."""
+        frames' int8 keys [n, kv heads, n_img, D] with scales [n, kv heads, n_img, 1].
+        M3 (2026-11-15), same values bit for bit as the einsum it replaced, ~3-4x faster: one batched matmul per kv
+        head group, the int8 -> float16 step compiled (fixed shape per batch, so compiled once), and the max over
+        image tokens taken before the float32 cast and the scale (both monotone for scale > 0, so the max is the
+        same element)."""
+        assert scale > 0, scale
         hk = k8.shape[1]
-        g = q.reshape(hk, q.shape[0] // hk, q.shape[1], q.shape[2])                       # [kv, group, Lq, D]
-        k = k8.astype(mx.float16) * ks                                                     # [n, kv, n_img, D]
-        s = mx.einsum("hgqd,nhkd->nhgqk", g, k).astype(mx.float32) * scale
-        return s.max(axis=-1).mean(axis=(1, 2, 3))
+        g = q.reshape(hk, (q.shape[0] // hk) * q.shape[1], q.shape[2])                    # [kv, group*Lq, D]
+        s = mx.matmul(g[None], _dequant(k8, ks).swapaxes(-1, -2)).max(axis=-1)            # [n, kv, group*Lq]
+        return (s.astype(mx.float32) * scale).mean(axis=(1, 2))
 
     def _key_screen(self, fid: int):
-        """Key a kept screen (quiet-time work): its features (from the Neural Engine, or encoded here if it couldn't),
-        saved to disk; its screen turn through text layers up to the last key layer; image-token keys at KEY_LAYERS,
+        """Key a kept screen (quiet-time work): its features (the current-screen read's when that frame was read, else
+        encoded here on the GPU; from the Neural Engine only if one is given to the encoder), saved to disk; its screen turn through text layers up to the last key layer; image-token keys at KEY_LAYERS,
         int8; and its score for the content-free query."""
         def g():
             yield "plan_build"
@@ -404,6 +478,9 @@ class RecallBackend:
             inp = self._inputs_like(meta["size"], a.screen_turn_prompt())
             if p["tokens"] is not None:
                 _, feats = a.feats_from_tokens(inp, p["tokens"])
+            elif fid in self.read_feats:                # the GPU already encoded this frame for a read
+                feats = self.read_feats.pop(fid)
+                self.stats["feats_reused"] = self.stats.get("feats_reused", 0) + 1
             else:
                 real = a._inputs(p["image"], a.screen_turn_prompt())
                 _, feats = yield from steps(a.encode_steps(p["image"], inp=real), ["patch"] + ["vision"] * 16 + ["pool"])
@@ -439,12 +516,23 @@ class RecallBackend:
             self.store.set_view(fid, self.ss.screens[fid])          # §5.25: its view text, a memory slot
             for vk in [k for k in self.store.views if int(k[5:]) not in self.ss.screens]:
                 self.store.drop_view(int(vk[5:]))
+                self._forget(vk)
             mx.clear_cache()
         return g()
 
     def find_screens(self, text: str) -> list[int]:
+        return self._run(self.find_screens_steps(text))
+
+    def retrieval_ready(self) -> bool:
+        """False while a retrieval's next piece waits for its keys to come off the disk (the scheduler runs other
+        work meanwhile)."""
+        f = self._pending_io
+        return f is None or f.done()
+
+    def find_screens_steps(self, text: str):
         """The kept screens to put in the context for this (partial) question: §12.17's combination of text (frame BM25)
-        and Gemma's keys (calibrated, z-normalised, summed over KEY_LAYERS), better rank first; top n_screens."""
+        and Gemma's keys (calibrated, z-normalised, summed over KEY_LAYERS), better rank first; top n_screens.
+        Generator (announce protocol): the question pass ("rq" pieces), then one "rs" piece per key layer and chunk."""
         if self.ss is None or self.n_screens <= 0:
             return []
         with self.store.lock:                           # the visit still on screen: the current screen supersedes it
@@ -454,23 +542,39 @@ class RecallBackend:
             return []
         with self.ss.lock:
             screens = [self.ss.screens[f] for f in fids]
-        if self._stack is None or self._stack[0] != (self.ss.version, tuple(fids)):
-            stack = {}
-            for L in KEY_LAYERS:
-                stack[L] = (mx.array(np.stack([s.keys[L][0] for s in screens])),
-                            mx.array(np.stack([s.keys[L][1] for s in screens])),
-                            np.array([s.null[L] for s in screens]))
-            self._stack = ((self.ss.version, tuple(fids)), stack)
-        stack = self._stack[1]
         T = screens[0].T
-        qv = self._queries(text, T)
+        qv = yield from self._queries_steps(text, T)
         total = np.zeros(len(fids))
+        # Keys are memory-mapped (nothing kept in RAM); macOS drops them under memory pressure, and reading one key
+        # layer of ~95 screens back from disk took 64-186 ms in the app (2026-11-15). So the reads happen on a loader
+        # thread, a chunk of KEY_CHUNK screens ahead (at most two chunks in RAM), and the GPU piece ("rs", one chunk)
+        # is runnable only once its chunk is in (`retrieval_ready`): the GPU loop never waits on the disk.
+        work = [(L, screens[i:i + KEY_CHUNK]) for L in KEY_LAYERS for i in range(0, len(screens), KEY_CHUNK)]
+
+        def load(L, part):
+            return np.stack([s.keys[L][0] for s in part]), np.stack([s.keys[L][1] for s in part])
+
+        futs = [self._io.submit(load, *work[0])]
+        raw = {L: [] for L in KEY_LAYERS}
+        try:
+            for j, (L, part) in enumerate(work):
+                if j + 1 < len(work):
+                    futs.append(self._io.submit(load, *work[j + 1]))
+                self._pending_io = futs[j]
+                yield "rs"
+                self._pending_io = None
+                k8, ks = futs[j].result()
+                futs[j] = None
+                q, scale = qv[L]
+                raw[L].append(np.asarray(self._score(q, scale, mx.array(k8), mx.array(ks))))
+                del k8, ks
+        finally:
+            self._pending_io = None
+            for f in futs:
+                if f is not None:
+                    f.cancel()
         for L in KEY_LAYERS:
-            q, scale = qv[L]
-            k8, ks, null = stack[L]
-            raw = np.concatenate([np.asarray(self._score(q, scale, k8[i:i + 32], ks[i:i + 32]))
-                                  for i in range(0, len(fids), 32)])
-            cal = raw - null
+            cal = np.concatenate(raw[L]) - np.array([s.null[L] for s in screens])
             total += (cal - cal.mean()) / (cal.std() + 1e-9)
         # §5.21 / §5.23 (adopted 2026-11-12): keys and the unit's text, each z-normalised, summed with equal weight.
         # The earlier better-rank fuse let the keys alone pick at 1 screen (text never won a disagreement).
@@ -478,7 +582,8 @@ class RecallBackend:
         zt = (bt - bt.mean()) / (bt.std() + 1e-9)
         self.last_ranked = [fids[i] for i in np.argsort(-(total + zt), kind="stable")][:max(self.n_screens, 3)]
         top = self.last_ranked[:self.n_screens]
-        return sorted(top, key=lambda f: self.ss.screens[f].t)
+        t_of = {f: s.t for f, s in zip(fids, screens)}   # the screens held here (one may expire between pieces)
+        return sorted(top, key=lambda f: t_of[f])
 
     def _history_ids(self, n: int) -> list[int]:
         """The first n exchanges, oldest dropped until they fit history_max_tokens."""
@@ -511,40 +616,96 @@ class RecallBackend:
     def history_over_cap(self) -> bool:
         return sum(len(self.a.exchange_ids(q, ans, older=True)) for q, ans in self.history) > self.history_max_tokens
 
-    def _exact_at(self, slots, i: int):
-        """The exact cache holding the prefix and slots[:i], cut back to there."""
-        if self.exact is None or self.exact_v != self.prefix_v:
-            self.exact, self.exact_v, self.exact_slots, self.bounds = clone_cache(self.prefix_cache), self.prefix_v, (), []
-        assert self.exact_slots[:i] == tuple(slots[:i]), (self.exact_slots, slots, i)
-        if i < len(self.bounds):
-            cut(self.lay, self.exact, *self.bounds[i])
-            self.bounds = self.bounds[:i]
-        self.exact_slots = self.exact_slots[:i]
-        return self.exact
+    def _branches(self) -> list:
+        if self.branch_v != self.prefix_v:              # a new prefix: everything computed after the old one is invalid
+            self.branches, self.branch_v = [], self.prefix_v
+        return self.branches
+
+    @staticmethod
+    def _common(a, b) -> int:
+        n = 0
+        while n < min(len(a), len(b)) and a[n] == b[n]:
+            n += 1
+        return n
+
+    def exact_len(self, slots) -> int:
+        """How many leading slots of `slots` some exact branch holds (the scheduler's frontier)."""
+        return max((self._common(b["slots"], tuple(slots)) for b in self._branches()), default=0)
+
+    def _branch(self, slots, i: int) -> dict:
+        """A branch holding the prefix and exactly slots[:i], to extend. One that holds exactly those is extended in
+        place; otherwise one that holds more is copied and the copy cut back, so the other context stays ready."""
+        bs, slots = self._branches(), tuple(slots)
+        own = next((b for b in bs if b["slots"] == slots[:i] and not b["busy"]), None)
+        if own is None:
+            src = next((b for b in bs if b["slots"][:i] == slots[:i] and len(b["bounds"]) > i), None)
+            if src is not None and i > 0:
+                c = clone_cache(src["cache"])
+                cut(self.lay, c, *src["bounds"][i])
+                own = {"cache": c, "slots": slots[:i], "bounds": list(src["bounds"][:i]), "busy": False}
+            else:
+                assert i == 0, (i, slots, [b["slots"] for b in bs])
+                own = {"cache": clone_cache(self.prefix_cache), "slots": (), "bounds": [], "busy": False}
+            bs.insert(0, own)
+        else:
+            if len(own["bounds"]) > i:                  # a slot started and dropped: cut it off
+                if i == 0:
+                    own["cache"] = clone_cache(self.prefix_cache)
+                else:
+                    cut(self.lay, own["cache"], *own["bounds"][i])
+                del own["bounds"][i:]
+            self._touch(own)
+        for b in [b for b in bs[MAX_BRANCHES:] if not b["busy"]]:   # least recently used first out
+            bs.remove(b)
+        return own
+
+    def end_turn(self):
+        """The turn closed: its exact branches and assembled context go (M3, 2026-11-13). After an answer the prefix
+        changes anyway (the exchange is appended); keeping them made idle memory step up by ~0.25 GB after the
+        first question and raised the peak of reads between turns."""
+        self.branches.clear()
+        self.base = None
+        mx.clear_cache()
+
+    def _touch(self, b: dict):
+        if b in self.branches:
+            self.branches.remove(b)
+        self.branches.insert(0, b)
 
     def upgrade(self, slots, i: int):
         def g():
             yield "check"
-            c = self._exact_at(slots, i)
-            self.bounds.append((int(c[0].offset), window_snapshot(self.lay, c)))
-            if kind(slots[i]) == SCREEN:
-                self.exact = yield from self._screen_into(c, slots[i][1])
-            else:
-                yield from self._prefill(c, self.page_ids(slots[i]))
-            self.exact_slots = tuple(slots[:i + 1])
+            b = self._branch(slots, i)
+            b["busy"] = True
+            try:
+                c = b["cache"]
+                b["bounds"].append((int(c[0].offset), window_snapshot(self.lay, c) if i > 0 else None))   # 0: the prefix
+                if kind(slots[i]) == SCREEN:
+                    b["cache"] = yield from self._screen_into(c, slots[i][1])
+                else:
+                    yield from self._prefill(c, self.page_ids(slots[i]))
+                b["slots"] = tuple(slots[:i + 1])
+            finally:                                    # dropped mid-slot: _branch cuts the started slot off on reuse
+                b["busy"] = False
         return g()
 
-    def _assemble(self, key, compute_missing: bool, exact_all: bool = False):
+    def _assemble(self, key, compute_missing: bool, exact_all: bool = False, take: bool = False):
         """The context before the question for `key` = (prefix version, slots, frontier, screen frame), as a new
-        cache. Generator: pages with no stored piece are computed in place (compute_missing) or not allowed."""
+        cache. Generator: pages with no stored piece are computed in place (compute_missing) or not allowed.
+        take: the answer's own assembly, the turn's last use of the branches: the branch is used itself, not copied,
+        and the others are dropped first (one context in memory instead of three at the answer's peak)."""
         v, slots, frontier, fid = key
         assert v == self.prefix_v, (v, self.prefix_v)
         if frontier:
-            assert self.exact_v == v and self.exact_slots[:frontier] == tuple(slots[:frontier])
-            assert len(self.bounds) >= frontier
-            c = clone_cache(self.exact)
-            if frontier < len(self.bounds):             # a page after the frontier was started: cut it off
-                cut(self.lay, c, *self.bounds[frontier])
+            b = next(b for b in self._branches() if b["slots"][:frontier] == tuple(slots[:frontier]))
+            if take:
+                self.branches.clear()
+                c = b["cache"]
+            else:
+                self._touch(b)
+                c = clone_cache(b["cache"])
+            if frontier < len(b["bounds"]):             # slots after the frontier (or one started): cut them off
+                cut(self.lay, c, *b["bounds"][frontier])
         else:
             c = clone_cache(self.prefix_cache)
         # Stored page pieces carry no window-layer entries, so nothing may be computed right after one (its window
@@ -561,24 +722,29 @@ class RecallBackend:
                 c = yield from self._screen_into(c, slot[1])
             else:
                 c = yield from self._prefill(c, self.page_ids(slot))
+        yield "append"          # its own piece: the copy and this were 54-75 ms together, over the 50 ms limit (M3)
         return K.append(self.lay, c, [self.piece(sl) for sl in rest[last + 1:]] + [self.screens[fid]], copy=False)
 
     def spec(self, key, ids, have):
-        """The question so far over the context `key`, leaving its last token for the answer to run."""
+        """The question so far over the context `key`, leaving its last token for the answer to run. Prefilled into the
+        assembled context itself; a changed question (or a prefill cut short) cuts back to the context's end."""
         def g():
             yield "assemble"
-            if self.base is None or self.base[0] != key:
-                base = yield from self._assemble(key, compute_missing=False)
-                self.base, self.spec_state = (key, base), None
-            s = self.spec_state
-            cov = 0
-            if s is not None and s["key"] == key and list(ids[:s["cov"]]) == list(s["ids"][:s["cov"]]):
-                cov = s["cov"]
-            else:
-                s = self.spec_state = {"key": key, "ids": (), "cov": 0, "cache": clone_cache(self.base[1])}
+            if self.base is None or self.base["key"] != key:
+                self.base = None                        # the old context goes before the new one is made
+                c = yield from self._assemble(key, compute_missing=False)
+                self.base = {"key": key, "cache": c, "end": (int(c[0].offset), window_snapshot(self.lay, c)),
+                             "ids": (), "cov": 0, "dirty": False}
+            s = self.base
+            cov = s["cov"] if not s["dirty"] and list(ids[:s["cov"]]) == list(s["ids"][:s["cov"]]) else 0
+            if cov < s["cov"] or s["dirty"]:
+                cut(self.lay, s["cache"], *s["end"])
+                s.update(ids=(), cov=0, dirty=False)
             target = len(ids) - 1
             if target > cov:
+                s["dirty"] = True                       # until the prefill finishes (a dropped job leaves it set)
                 yield from self._prefill(s["cache"], list(ids[cov:target]), layers=4)
+                s["dirty"] = False
             s.update(ids=tuple(ids), cov=max(cov, target))
         return g()
 
@@ -588,22 +754,27 @@ class RecallBackend:
             r = io.result
             yield "assemble"
             key, words = plan["key"], list(plan["words"])
-            s = self.spec_state
-            if (s is not None and s["key"] == key and s["cov"] > 0 and words[:s["cov"]] == list(s["ids"][:s["cov"]])
-                    and s["cov"] < len(words)):
+            s, self.base = self.base, None
+            if s is not None and s["key"] == key:
+                self.branches.clear()                   # the context is assembled: the branches aren't needed
+            if (s is not None and s["key"] == key and not s["dirty"] and 0 < s["cov"] < len(words)
+                    and words[:s["cov"]] == list(s["ids"][:s["cov"]])):
                 cache, ids, r["context"] = s["cache"], words[s["cov"]:], "question prefilled"
-            elif self.base is not None and self.base[0] == key:
-                cache, ids, r["context"] = clone_cache(self.base[1]), words, "assembled before key up"
+            elif s is not None and s["key"] == key:
+                if s["cov"] or s["dirty"]:
+                    cut(self.lay, s["cache"], *s["end"])
+                cache, ids, r["context"] = s["cache"], words, "assembled before key up"
             else:
-                cache = yield from self._assemble(key, compute_missing=True)
+                s = None
+                cache = yield from self._assemble(key, compute_missing=True, take=True)
                 ids, r["context"] = words, "assembled at release"
-            self.spec_state = self.base = None
+            del s
             r.update(context_tokens=int(cache[0].offset), question_tokens=len(words), prefilled_at_release=len(ids),
                      pages=len(plan["pages"]), exact_pages=plan["frontier"], missing=len(plan["missing"]),
                      screen_frame=plan["screen"])
             io.mark("restore_done")
             text = yield from self._speak(cache, ids, io, plan["on_first_token"])
-            done = bool(text.strip()) and not io.cancel.is_set()
+            done = bool(text.strip()) and not io.cancel.is_set() and not io.warmup
             if done:
                 self.history.append((io.question, text.strip()))
             r.update(answer=text.strip(), stop=self.a.last_stop if not io.cancel.is_set() else "cancel",
@@ -614,9 +785,38 @@ class RecallBackend:
 
     def _speak(self, cache, ids, io: TurnIO, on_first_token):
         """Decode, one token a piece, handing phrases and sentences to TTS as they complete (GpuWorker._answer's
-        rules: an early first phrase, then whole sentences)."""
+        rules: an early first phrase, then whole sentences). TTS runs on its own thread (M3, 2026-11-13): Kokoro
+        synthesizes on the Neural Engine while decoding goes on, instead of decoding waiting for each chunk."""
         r = io.result
         text, buf, chunks = "", "", 0
+        q: queue.SimpleQueue = queue.SimpleQueue()
+
+        def tts_loop():
+            first = True
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                sentence, mid_sentence = item
+                if io.cancel.is_set():
+                    continue                            # drain: nothing more is spoken
+                t0 = time.perf_counter()
+                # The answer's first chunk starts at its first sample above -50 dB (the audible threshold): the 30 ms
+                # pad kept before later chunks spaces them; before the first it only delays the answer (M3, 2026-11-15).
+                for audio in self.tts.synth(sentence, cancel=io.cancel, trim=self.trim,
+                                            tail_keep_ms=40 if mid_sentence else 120, lead_keep_ms=0 if first else 30):
+                    if first:
+                        io.mark("tts_first_chunk")
+                        r["tts_first_ms"] = {"round_trip": round((time.perf_counter() - t0) * 1000, 1),
+                                             "kokoro": getattr(self.tts, "last_seconds", None)}
+                        first = False
+                    io.emit_audio(audio, self.tts.sample_rate)
+                    if io.cancel.is_set():
+                        break
+
+        if self.tts is not None:
+            io.tts_thread = threading.Thread(target=tts_loop, daemon=True, name="tts")
+            io.tts_thread.start()
 
         def first():
             io.mark("first_token")
@@ -628,42 +828,36 @@ class RecallBackend:
             if chunks == 1:
                 io.mark("first_sentence_ready")
                 r["first_chunk_text"] = sentence
-            if self.tts is None:
-                return
-            marked = False
-            for audio in self.tts.synth(sentence, cancel=io.cancel, trim=self.trim,
-                                        tail_keep_ms=40 if mid_sentence else 120):
-                if not marked and chunks == 1:
-                    io.mark("tts_first_chunk")
-                    marked = True
-                io.emit_audio(audio, self.tts.sample_rate)
-                if io.cancel.is_set():
-                    return
+            if self.tts is not None:
+                q.put((sentence, mid_sentence))
 
-        gen = self.a.generate(cache, ids, cancel=io.cancel, on_first_token=first)
-        kind = "answer_prefill"
-        while True:
-            yield kind
-            kind = "decode"
-            try:
-                delta = next(gen)
-            except StopIteration:
-                break
-            text += delta
-            buf += delta
-            done, buf = split_complete_sentences(buf)
-            if self.first_chunk == "phrase" and chunks == 0 and not done:
-                ph = split_first_phrase(buf)
-                if ph is not None:
-                    speak(ph[0], mid_sentence=True)
-                    buf = ph[1]
-            for sentence in done:
+        try:
+            gen = self.a.generate(cache, ids, cancel=io.cancel, on_first_token=first)
+            kind = "answer_prefill"
+            while True:
+                yield kind
+                kind = "decode"
+                try:
+                    delta = next(gen)
+                except StopIteration:
+                    break
+                text += delta
+                buf += delta
+                done, buf = split_complete_sentences(buf)
+                if self.first_chunk == "phrase" and chunks == 0 and not done:
+                    ph = split_first_phrase(buf, min_words=FIRST_MIN_WORDS, max_words=FIRST_MAX_WORDS)
+                    if ph is not None:
+                        speak(ph[0], mid_sentence=True)
+                        buf = ph[1]
+                for sentence in done:
+                    if io.cancel.is_set():
+                        break
+                    speak(sentence)
                 if io.cancel.is_set():
                     break
-                speak(sentence)
-            if io.cancel.is_set():
-                break
-        if buf.strip() and not io.cancel.is_set():
-            speak(buf.strip())
+            if buf.strip() and not io.cancel.is_set():
+                speak(buf.strip())
+        finally:
+            q.put(None)                                 # the TTS thread ends after what is queued
         r["chunks_spoken"] = chunks
         return text

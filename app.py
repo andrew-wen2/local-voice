@@ -29,6 +29,7 @@ import subprocess  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
+from collections import deque  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 
@@ -72,7 +73,7 @@ class Monitor(threading.Thread):
     def __init__(self, pids_fn):
         super().__init__(daemon=True, name="monitor")
         self.pids_fn = pids_fn
-        self.samples: list[dict] = []
+        self.samples: deque = deque(maxlen=900)         # once a second: the last 15 minutes
         self._stop = threading.Event()
         self.macmon = None
         try:
@@ -105,7 +106,7 @@ class Monitor(threading.Thread):
             self._stop.wait(1.0)
 
     def window(self, t0: float, t1: float) -> dict:
-        s = [x for x in self.samples if t0 - 1 <= x["t"] <= t1 + 1]
+        s = [x for x in list(self.samples) if t0 - 1 <= x["t"] <= t1 + 1]   # snapshot: the monitor thread appends
         if not s:
             return {}
         gb = lambda b: round(b / 1e9, 2)
@@ -318,12 +319,12 @@ def live(args):
 
         def run():
             row = asst.answer_turn(audio, emit, lambda n: marks.setdefault(n, time.perf_counter()), t_eos_wall, t_eos)
-            used = next((h for h in reversed(watcher.handed) if h["frame_id"] == row.get("frame_id")), {})
+            used = next((h for h in reversed(list(watcher.handed)) if h["frame_id"] == row.get("frame_id")), {})
             row.update(apps_at_press=turn.get("apps_at_press"), apps_at_eos=apps_at_eos, talk_source=turn.get("source"),
                        answered_frame={k: used.get(k) for k in ("frame_id", "reason", "apps", "waited_s")},
                        answered_frame_age_s=round(t_eos_wall - used["captured_at"], 2) if used else None,
                        newest_frame_at_eos={k: last_handed.get(k) for k in ("frame_id", "reason", "apps")},
-                       frames_sent_total=len(watcher.handed), displays=scr.active_displays())
+                       frames_sent_total=watcher.frame_id, displays=scr.active_displays())
             speaker.wait_done(60)
             asst.worker.set_turn_active(False)
             ms = {k: round((v - t_eos) * 1000, 1) for k, v in marks.items()}
