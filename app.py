@@ -5,8 +5,6 @@
                                      Option in any app to talk (release = stop, press while it speaks = interrupt);
                                      Enter in the terminal also works (talk / stop / interrupt), q = quit
   python app.py --screen-only        the previous app: the current screen only, no memory of past screens
-  python app.py --replay reading     replay a test set through the timing harness (reading|reasoning|voice|contention)
-  python app.py --replay voice --sandbox-profile eval/offline.sb   (used by the offline test)
 
 Review decisions implemented here: readiness gate (D8), Screen Recording check + near-silent
 flag (D5), interrupt stops the work (D6), per-turn logs with combined memory (D19), screen age
@@ -23,7 +21,6 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import argparse  # noqa: E402
 import ctypes  # noqa: E402
 import json  # noqa: E402
-import re  # noqa: E402
 import statistics  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
@@ -42,8 +39,7 @@ from engine import AnswerJob, GemmaAdapter, GpuWorker, make_tts  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
-QDIR = ROOT / "harness/questions"
-M0_SCREENS = ROOT / "m0_screen/screens"
+WARM_WAV = ROOT / "assets/warmup.wav"         # a spoken question for warming up speech recognition
 
 
 # ---------------------------------------------------------------- memory, power, fans
@@ -134,7 +130,7 @@ class Monitor(threading.Thread):
 class Assistant:
     def __init__(self, budget: int = 1120, sandbox_profile: Optional[Path] = None, swap_weights: bool = True,
                  **worker_opts):
-        """worker_opts go to GpuWorker: first_chunk, trim_silence, mlx_cache_gb, policy, freshness,
+        """worker_opts go to GpuWorker: trim_silence, mlx_cache_gb, policy, freshness,
         fresh_ms, layers_per_piece, min_read_interval_s, duty_cap."""
         self.budget = budget
         self.worker_opts = worker_opts
@@ -155,7 +151,7 @@ class Assistant:
         self.monitor.start()
         self.startup["asr_start_s"] = round(self.asr.start(sandbox_profile=self.sandbox_profile), 2)
         t0 = time.perf_counter()
-        self.asr.transcribe((QDIR / "v01.wav").read_bytes())
+        self.asr.transcribe(WARM_WAV.read_bytes())
         self.startup["asr_warm_s"] = round(time.perf_counter() - t0, 2)
         self.startup["swap_weights"] = self.swap_weights
         self.worker = GpuWorker(GemmaAdapter(swap_weights=self.swap_weights), self.tts,
@@ -208,7 +204,7 @@ class Assistant:
         job = self.worker.submit_answer(AnswerJob(tr["text"], emit_audio=emit_audio, mark=mark))
         job.done.wait(120)
         r = job.result
-        row.update({k: r.get(k) for k in ("answer", "stop", "cap_hit", "cancelled", "sentences_spoken", "chunks_spoken", "first_chunk_text", "first_chunk_mode", "frame_id",
+        row.update({k: r.get(k) for k in ("answer", "stop", "cap_hit", "cancelled", "sentences_spoken", "chunks_spoken", "first_chunk_text", "frame_id",
                                           "budget", "read_in_flight_at_submit", "question_tokens", "error",
                                           "policy", "fresh_decision", "read_paused", "stale_vs_submit",
                                           "context_tokens", "history_exchanges")})
@@ -303,7 +299,7 @@ def live(args):
 
         def emit(samples, sr):
             if "t" not in first_audio:
-                from harness.harness import first_audible
+                from audio_io import first_audible
                 i = first_audible(samples)
                 if i is not None:
                     first_audio["t"] = time.perf_counter() + i / sr
@@ -405,7 +401,7 @@ def live_recall(args):
 
     app = RecallApp(grab=cap.grab, grab_small=grab_small, speaker=speaker, mic=mic, budget=args.budget,
                     swap_weights=getattr(args, "swap_weights", "on") == "on",
-                    freshness="C" if o["freshness"] == "C" else "B", first_chunk=o["first_chunk"],
+                    freshness="C" if o["freshness"] == "C" else "B",
                     trim_silence=o["trim_silence"], mlx_cache_gb=o["mlx_cache_gb"],
                     log_path=LOGS / f"turns-recall-{time.strftime('%Y%m%d-%H%M%S')}.jsonl",
                     show_text=getattr(args, "show_text", False), on_row=on_row, on_ui=on_ui if ui else None)
@@ -451,200 +447,7 @@ def live_recall(args):
     cap.cleanup()
 
 
-def norm(s: str) -> str:
-    return re.sub(r"[\s,$*`'\"]", "", s.lower())
-
-
-_NUM_WORDS = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
-              "sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety "
-              "hundred thousand million point and").split()
-
-
-def spoken_forms(a: str) -> list[str]:
-    """'23' -> ['twenty three']; '0.0825' -> ['zero point zero eight two five']. Non-numbers: []."""
-    if not re.fullmatch(r"\d+(\.\d+)?", a):
-        return []
-    from num2words import num2words
-    w = num2words(float(a) if "." in a else int(a)).replace("-", " ").replace(",", "")
-    return sorted({w, w.replace(" and ", " ")})
-
-
-def _spoken_match(answer: str, form: str) -> bool:
-    """Whole-word match that is not part of a bigger number ('three' does not match 'thirty three')."""
-    words = [w.strip(".") for w in re.sub(r"[^a-z0-9.]+", " ", answer.lower().replace("-", " ")).split()]
-    f = form.split()
-    for i in range(len(words) - len(f) + 1):
-        if words[i:i + len(f)] == f:
-            before = words[i - 1] if i else ""
-            after = words[i + len(f)] if i + len(f) < len(words) else ""
-            if before not in _NUM_WORDS and after not in _NUM_WORDS:
-                return True
-    return False
-
-
-def score_reading(answer: str, accept) -> bool:
-    """Substring match as in M0, plus spelled-out numbers (the spoken-style prompt says 'three', not '3')."""
-    if any(a in norm(answer or "") for a in accept):
-        return True
-    return any(_spoken_match(answer or "", f) for a in accept for f in spoken_forms(a))
-
-
-def score_key_points(answer: str, key_points) -> bool:
-    a = (answer or "").lower()
-    return all(any(alt.lower() in a for alt in group) for group in key_points)
-
-
-class ReplayPipeline:
-    """Harness pipeline for push-to-talk replay (D7 end_turn, D15 turn complete, D17 scripted screen changes)."""
-
-    signals_turn_complete = True
-
-    def __init__(self, asst: Assistant, screens: dict, rows: list):
-        self.asst, self.screens, self.rows = asst, screens, rows
-        self.case = None
-        self.frame_id = 1000
-
-    def prepare(self, case: dict, speech_end_s: float):
-        """Before a turn: show `before`, wait until it is read and a spare copy is ready."""
-        self.case, self.speech_end_s = case, speech_end_s
-        w = self.asst.worker
-        before = case.get("before") or case.get("screen")
-        if before and (w.snapshot is None or getattr(w.snapshot, "_screen", None) != before):
-            self.frame_id += 1
-            fid = self.frame_id
-            w.submit_frame(fid, time.time(), self.screens[before])
-            while w.snapshot is None or w.snapshot.frame_id != fid:
-                time.sleep(0.02)
-            w.snapshot._screen = before
-        while w.snapshot.spare is None:
-            time.sleep(0.02)
-        self.frame_screens = {w.snapshot.frame_id: before}
-        self.pre_changed = False
-        c = case
-        if c.get("after") and c["ref"] == "rec_start" and c["offset_s"] < 0:
-            # change happens |offset| before recording starts: submit now, start the turn |offset| later
-            self._change(c["after"])
-            time.sleep(-c["offset_s"])
-            self.pre_changed = True
-
-    def _change(self, name: str):
-        self.frame_id += 1
-        self.frame_screens[self.frame_id] = name
-        self.asst.worker.submit_frame(self.frame_id, time.time(), self.screens[name])
-
-    def reset(self):
-        self.audio, self.started_at, self.timer = [], None, None
-
-    def start(self, emit_audio, mark):
-        self.emit, self.mark = emit_audio, mark
-
-    def on_audio(self, chunk):
-        if self.started_at is None:                          # recording starts with the first chunk
-            self.started_at = time.perf_counter()
-            self.asst.worker.set_turn_active(True)
-            c = self.case
-            if c.get("after") and not self.pre_changed:   # change during the question
-                at = c["offset_s"] if c["ref"] == "rec_start" else self.speech_end_s + c["offset_s"]
-                self.timer = threading.Timer(max(0.0, at), self._change, args=(c["after"],))
-                self.timer.start()
-        self.audio.append(chunk)
-
-    def end_turn(self):
-        t_eos, t_eos_wall = time.perf_counter(), time.time()
-        audio = np.concatenate(self.audio).astype(np.float32)
-
-        def run():
-            row = self.asst.answer_turn(audio, self.emit, self.mark, t_eos_wall, t_eos)
-            self.asst.worker.set_turn_active(False)
-            row["answered_screen"] = self.frame_screens.get(row.get("frame_id"))
-            self.rows.append(row)
-            self.mark("turn_complete")
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def stop(self):
-        if self.timer:
-            self.timer.cancel()
-
-
-def replay(args):
-    from PIL import Image
-    from harness import harness as H
-
-    sets = json.loads((QDIR / "sets.json").read_text())
-    index = {q["id"]: q for q in json.loads((QDIR / "index.json").read_text())}
-    screens = {p.stem: Image.open(p).convert("RGB") for p in M0_SCREENS.glob("*.png")}
-    if args.replay == "contention":
-        cases = json.loads((ROOT / "eval/contention.json").read_text())["cases"]
-    else:
-        cases = sets[args.replay]
-    asst = Assistant(budget=args.budget, sandbox_profile=Path(args.sandbox_profile) if args.sandbox_profile else None,
-                     swap_weights=getattr(args, "swap_weights", "on") == "on", **worker_opts(args))
-    first = cases[0].get("before") or cases[0].get("screen")
-    asst.start(warm_image=screens[first], first_frame=(1, time.time(), screens[first]))
-    rows: list = []
-    pipe = ReplayPipeline(asst, screens, rows)
-    results = []
-    for rep in range(args.repeats):
-        for c in cases:
-            qid = c.get("q") or c["id"]
-            q = index[qid]
-            pipe.prepare(c, q["speech_end_s"])
-            t_wall0 = time.time()
-            r = H.run_turn(pipe, q, timeout_s=60)
-            row = rows[-1] if rows else {}
-            target = c.get("after") or c.get("screen")
-            ans = row.get("answer") or ""
-            ok = None
-            if "accept" in c:
-                ok = score_reading(ans, c["accept"])
-            elif "key_points" in c:
-                ok = score_key_points(ans, c["key_points"])
-            res = {"case": c["id"], "q": qid, "repeat": rep, "latency_ms": r["latency_ms"], "marks_ms": r["marks_ms"],
-                   "turn_complete_ms": r["turn_complete_ms"], "audio_s": r["audio_s"],
-                   "end_turn_late_ms": r["end_turn_late_ms"], "target_screen": target,
-                   "stale": (row.get("answered_screen") != target) if target else None,
-                   "script_correct": ok, **row, **asst.monitor.window(t_wall0, time.time())}
-            results.append(res)
-            print(json.dumps({k: res.get(k) for k in ("case", "latency_ms", "script_correct", "stale",
-                                                     "wait_behind_read_ms", "read_in_flight_at_submit",
-                                                     "fresh_decision", "read_paused", "answer")}),
-                  flush=True)
-    asst.stop()
-    out = LOGS / f"replay-{args.replay}-{args.budget}-{getattr(args, 'policy', 'p2')}{getattr(args, 'freshness', 'B')}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
-    with out.open("w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
-    summary = summarize(results)
-    summary.update(set=args.replay, budget=args.budget, policy=getattr(args, "policy", "p2"),
-                   freshness=getattr(args, "freshness", "B"), startup=asst.startup, log=str(out),
-                   reads_dropped=asst.worker.stats.get("reads_dropped"))
-    print("SUMMARY", json.dumps(summary))
-    return summary
-
-
-def summarize(results: list) -> dict:
-    lat = sorted(r["latency_ms"] for r in results if r.get("latency_ms") is not None)
-    p = lambda q: lat[min(len(lat) - 1, int(np.ceil(q * len(lat))) - 1)] if lat else None
-    scored = [r for r in results if r.get("script_correct") is not None]
-    return {
-        "n": len(results), "answered": len(lat),
-        "latency_median_ms": round(statistics.median(lat), 1) if lat else None, "latency_p95_ms": p(0.95),
-        "script_correct": f"{sum(r['script_correct'] for r in scored)}/{len(scored)}" if scored else None,
-        "stale": sum(1 for r in results if r.get("stale")),
-        "waited_behind_read": sum(1 for r in results if r.get("read_in_flight_at_submit")),
-        "wait_ms_max": max((r.get("wait_behind_read_ms") or 0) for r in results) if results else None,
-        "read_paused": sum(1 for r in results if r.get("read_paused")),
-        "waited_for_fresh": sum(1 for r in results if r.get("fresh_decision") == "read_first"),
-        "mem_peak_gb": max((r.get("mem_peak_gb") or 0) for r in results) or None,
-        "fan_max_rpm": max((r.get("fan_max_rpm") or 0) for r in results) if results else None,
-        "cap_hits": sum(1 for r in results if r.get("cap_hit")),
-    }
-
-
 def add_worker_args(ap):
-    ap.add_argument("--first-chunk", choices=["phrase", "sentence"], default="phrase",
-                    help="start speaking on an early phrase of the first sentence, or wait for the whole sentence")
     ap.add_argument("--no-trim", action="store_true", help="keep Kokoro's built-in leading/trailing silence")
     ap.add_argument("--mlx-cache-gb", type=float, default=0.0,
                     help="cap on MLX's reusable buffer cache (default 0; -1 = MLX default, uncapped)")
@@ -668,7 +471,7 @@ def add_worker_args(ap):
 
 def worker_opts(args) -> dict:
     g = lambda k, d: getattr(args, k, d)
-    return dict(first_chunk=g("first_chunk", "phrase"), trim_silence=not g("no_trim", False),
+    return dict(trim_silence=not g("no_trim", False),
                 mlx_cache_gb=None if g("mlx_cache_gb", 0.0) < 0 else g("mlx_cache_gb", 0.0),
                 policy=g("policy", "p2"), freshness=g("freshness", "B"), fresh_ms=g("fresh_ms", 300.0),
                 layers_per_piece=g("layers_per_piece", 2), min_read_interval_s=g("min_read_interval", 0.0),
@@ -680,8 +483,6 @@ def main():
     ap = argparse.ArgumentParser()
     add_worker_args(ap)
     ap.add_argument("--budget", type=int, default=1120, help="image token budget: 1120 (default, reads normal ~13 pt app text) or 560 (light mode, misreads small digits/IDs)")
-    ap.add_argument("--replay", choices=["reading", "reasoning", "voice", "contention"])
-    ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--sandbox-profile", default="")
     ap.add_argument("--ui-events", action="store_true",
                     help="print caption events as '@ui {json}' lines and hide the parent app's windows from screen reads "
@@ -689,9 +490,7 @@ def main():
     ap.add_argument("--screen-only", action="store_true",
                     help="the previous app: answer from the current screen only, no memory of past screens")
     args = ap.parse_args()
-    if args.replay:
-        replay(args)                     # the timing harness still replays the current-screen app (GpuWorker)
-    elif args.screen_only:
+    if args.screen_only:
         live(args)
     else:
         live_recall(args)                # the shipped app: recall mode (ARCHITECTURE.md §5.9)

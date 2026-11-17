@@ -59,5 +59,4 @@ Done. Before the first run, allow the terminal app in System Settings > Privacy 
   Input Monitoring (hold Right Option anywhere to talk; optional, Enter works too).
 Then:  .venv/bin/python menubar.py   (menu bar icon: Turn On / Turn Off; Off wipes what it saw)
    or:  .venv/bin/python app.py       (same assistant, run in the terminal)
-Benchmark screens (optional, needs Google Chrome): .venv/bin/python eval/recall/make_sessions.py --sessions h1,h2,h3,h4
 MSG

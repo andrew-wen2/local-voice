@@ -149,9 +149,13 @@ def test_the_visit_still_on_screen_is_left_out():
 
 def test_eval_screen_cache_round_trip(tmp_path):
     import importlib.util
+
+    import pytest
     import sys
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
+    if not (root / "eval/real/visual_e2e.py").exists():
+        pytest.skip("needs the local eval scripts (eval/, not on GitHub)")
     sys.path[:0] = [str(root / "eval/recall"), str(root / "eval/kernels"), str(root / "eval/real")]
     spec = importlib.util.spec_from_file_location("visual_e2e", root / "eval/real/visual_e2e.py")
     E = importlib.util.module_from_spec(spec)

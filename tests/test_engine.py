@@ -320,6 +320,8 @@ def test_duty_cap_defers_reads_but_not_reads_an_answer_needs(monkeypatch):
 
 @pytest.fixture(scope="module")
 def gemma():
+    if not (M0 / "questions.json").exists():
+        pytest.skip("needs the local reading set (m0_screen/, not on GitHub)")
     a = engine.GemmaAdapter(instruction=M0_INSTRUCTION).load()
     a.set_budget(560)
     return a
@@ -379,23 +381,13 @@ def test_cancel_stops_within_one_token(gemma):
 
 # -- latency fixes (2026-11-06): early first phrase + Kokoro silence trim
 
-def test_first_phrase_splits_at_comma_after_enough_words():
-    assert engine.split_first_phrase("Hello, there is a typo") is None              # comma too early, < 7 words
-    assert engine.split_first_phrase("The file looks fine, but line ")[0] == "The file looks fine,"
-
-
-def test_first_phrase_splits_before_break_word():
-    ph = engine.split_first_phrase("The capital of Australia is Canberra and ")
-    assert ph == ("The capital of Australia", "is Canberra and ")
-
-
-def test_first_phrase_waits_when_short_or_no_break():
-    assert engine.split_first_phrase("There are ninety minutes") is None
-    assert engine.split_first_phrase("Octopuses really really really truly deeply amazingly ") is None
-
-
-def test_first_phrase_ignores_unfinished_word():
-    assert engine.split_first_phrase("A compiler translates source code written in") is None  # 'in' not complete yet
+def test_first_phrase_splits_only_at_punctuation():
+    """§5.33: a split only where a speaker pauses; otherwise the first sentence is spoken whole."""
+    assert engine.split_first_phrase("The rent was $3,488 a month, with ")[0] == "The rent was $3,488 a month,"
+    assert engine.split_first_phrase("The file looks fine; but line ")[0] == "The file looks fine;"
+    assert engine.split_first_phrase("Yes, the flight leaves ") is None                   # comma before 3 words
+    assert engine.split_first_phrase("The capital of Australia is Canberra and ") is None  # no split before "is"
+    assert engine.split_first_phrase("Hello, there is a typo", min_words=4) is None
 
 
 def test_trim_silence_keeps_short_pad():

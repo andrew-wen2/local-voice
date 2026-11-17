@@ -58,6 +58,7 @@ PARAKEET_KNOWN = {"rd01", "rd02", "rd05", "rd06", "rd12", "rd13"}
 
 
 @needs_parakeet
+@pytest.mark.skipif(not (QDIR / "index.json").exists(), reason="needs the local question set (harness/, not on GitHub)")
 def test_parakeet_transcribes_recorded_questions():
     s = ParakeetServer()
     s.start(sandbox_profile=ROOT / "eval/offline.sb")

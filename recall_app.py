@@ -32,7 +32,7 @@ from screen_store import ScreenStore
 
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
-WARM_WAV = ROOT / "harness/questions/v01.wav"
+WARM_WAV = ROOT / "assets/warmup.wav"
 WARM_Q = "What's on my screen right now?"
 
 
@@ -40,7 +40,7 @@ class RecallApp:
     def __init__(self, *, grab: Callable, speaker, mic, grab_small: Optional[Callable] = None,
                  windows_fn: Callable[[], list] = windows, clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep, budget: int = 1120, swap_weights: bool = True,
-                 freshness: str = "B", first_chunk: str = "phrase", trim_silence: bool = True,
+                 freshness: str = "B", trim_silence: bool = True,
                  mlx_cache_gb: Optional[float] = 0.0, log_path: Optional[Path] = None,
                  show_text: bool = False, on_row: Optional[Callable[[dict], None]] = None, monitor: bool = True,
                  on_ui: Optional[Callable[[dict], None]] = None):
@@ -48,7 +48,7 @@ class RecallApp:
         self.clock, self.sleep = clock, sleep
         self.speaker, self.mic = speaker, mic
         self.budget, self.swap_weights, self.freshness = budget, swap_weights, freshness
-        self.first_chunk, self.trim_silence, self.mlx_cache_gb = first_chunk, trim_silence, mlx_cache_gb
+        self.trim_silence, self.mlx_cache_gb = trim_silence, mlx_cache_gb
         self.log_path, self.show_text, self.on_row = log_path, show_text, on_row
         self.want_monitor = monitor
         self.on_ui = on_ui                               # caption events for the menu bar panel (menubar.py)
@@ -87,7 +87,7 @@ class RecallApp:
         self.screens = ScreenStore()                     # kept screens: owner-only folder, deleted on quit (§5.12)
         adapter = GemmaAdapter(swap_weights=self.swap_weights, instruction=RECALL_INSTRUCTION)
         self.worker = RecallWorker(adapter, self.tts, self.store, budget=self.budget, freshness=self.freshness,
-                                   first_chunk=self.first_chunk, trim_silence=self.trim_silence,
+                                   trim_silence=self.trim_silence,
                                    mlx_cache_gb=self.mlx_cache_gb, screen_store=self.screens)
         print("starting (first launch can take a few minutes)...", flush=True)
         self.worker.start()
@@ -225,7 +225,7 @@ class RecallApp:
 
         def emit(samples, sr):
             if "t" not in first_audio:
-                from harness.harness import first_audible
+                from audio_io import first_audible
                 i = first_audible(samples)
                 if i is not None:
                     first_audio["t"] = time.perf_counter() + i / sr

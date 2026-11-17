@@ -1,4 +1,4 @@
-"""Tests for app.py: readiness gate (D8), permission exit + near-silent flag (D5), scoring (D10), memory (D19)."""
+"""Tests for app.py: readiness gate (D8), permission exit + near-silent flag (D5), memory (D19)."""
 import os
 import types
 
@@ -6,27 +6,6 @@ import numpy as np
 import pytest
 
 import app
-
-
-def test_score_reading_substring():
-    assert app.score_reading("The rate is 0.0825.", ["0.0825"])
-    assert not app.score_reading("It is subtotal.", ["subtotl"])
-
-
-def test_score_reading_spelled_out_numbers():
-    assert app.score_reading("Three tests failed in total.", ["3"])
-    assert app.score_reading("The Inbox badge shows twenty-three unread emails.", ["23"])
-    assert app.score_reading("the value zero point zero eight two five.", ["0.0825"])
-    assert app.score_reading("It has three hundred eighteen units.", ["318"])
-    assert not app.score_reading("the value zero point zero zero two five.", ["0.0825"])
-    assert not app.score_reading("There are thirty-three tests.", ["3"])
-    assert not app.score_reading("Three hundred units.", ["3"])
-
-
-def test_score_key_points_needs_every_group():
-    kp = [["subtotl", "typo"], ["subtotal"]]
-    assert app.score_key_points("Line 31 has a typo: subtotl should be subtotal.", kp)
-    assert not app.score_key_points("There is a typo on line 31.", kp)
 
 
 def test_turn_refused_before_ready():

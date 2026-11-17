@@ -25,12 +25,12 @@ CAP = 4000          # memory slot cap, tokens (timeline + pages), as the M1 runs
 
 class RecallWorker(threading.Thread):
     def __init__(self, adapter, tts, store, budget: int = 1120, cap: int = CAP, freshness: str = "B",
-                 first_chunk: str = "phrase", trim_silence: bool = True, mlx_cache_gb: Optional[float] = 0.0,
+                 trim_silence: bool = True, mlx_cache_gb: Optional[float] = 0.0,
                  history_max_tokens: int = 2000, backend_factory: Optional[Callable] = None, screen_store=None):
         super().__init__(daemon=True, name="recall-gpu")
         self.adapter, self.tts, self.store, self.budget, self.cap = adapter, tts, store, budget, cap
         self._slots: dict = {}                          # (view, version, room) -> a kept screen's block slot
-        self.freshness, self.first_chunk, self.trim, self.mlx_cache_gb = freshness, first_chunk, trim_silence, mlx_cache_gb
+        self.freshness, self.trim, self.mlx_cache_gb = freshness, trim_silence, mlx_cache_gb
         self.history_max_tokens = history_max_tokens
         self.backend_factory = backend_factory
         self.screen_store = screen_store
@@ -252,7 +252,7 @@ class RecallWorker(threading.Thread):
             self.startup["kokoro_load_warm_s"] = round(time.perf_counter() - t0, 2)
         t0 = time.perf_counter()
         self.backend = (self.backend_factory() if self.backend_factory is not None else
-                        RecallBackend(a, self.store, self.tts, first_chunk=self.first_chunk,
+                        RecallBackend(a, self.store, self.tts,
                                       trim_silence=self.trim, history_max_tokens=self.history_max_tokens,
                                       screen_store=self.screen_store))
         self.startup["anchors_s"] = round(time.perf_counter() - t0, 2)

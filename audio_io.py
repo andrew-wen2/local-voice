@@ -17,6 +17,14 @@ from typing import Optional
 import numpy as np
 
 SILENT_DBFS = -50.0
+AUDIBLE_DB = -50.0                 # the first audible sample of an answer: first audio is timed to it
+
+
+def first_audible(samples) -> Optional[int]:
+    """Index of the first sample above AUDIBLE_DB, or None."""
+    idx = np.nonzero(np.abs(samples) > 10 ** (AUDIBLE_DB / 20))[0]
+    return int(idx[0]) if len(idx) else None
+
 # Voice activity while the key is held (recall mode, ARCHITECTURE.md §5.9). Provisional, and only used for
 # scheduling: a block is voiced above VOICE_DBFS; the mic counts as silent after SILENCE_S without a voiced block.
 VOICE_DBFS = -45.0

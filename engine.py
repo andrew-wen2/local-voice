@@ -11,7 +11,7 @@ Pieces:
       * spare cache copy prepared in the background (D12).
       * answers stop at the 3rd sentence or 120 tokens (D9); cancel checked every token (D6).
   - AneTts: Kokoro on the Neural Engine in a helper process, one sentence at a time, cancel checked per
-    sentence (D6). Its leading silence is trimmed; the first chunk can be an early phrase (first_chunk="phrase").
+    sentence (D6). Its leading silence is trimmed; the first chunk is split early at a pause (split_first_phrase).
   - GpuWorker: the scheduler. Answer jobs first; screen reads run in pieces and pause for
     answers (policy p2), or follow the MVP baseline (p0) / wait-for-read (p1) for comparison.
 """
@@ -96,26 +96,15 @@ def count_sentences(text: str) -> int:
 
 
 _PHRASE_PUNCT = re.compile(r"[,;:\u2014\u2013](?=\s)")
-BREAK_WORDS = {"and", "but", "because", "which", "that", "so", "with", "in", "on", "for", "to", "of",
-               "from", "is", "are", "was", "were", "shows", "says", "means", "has", "have"}
 
 
-def split_first_phrase(buffer: str, min_words: int = 4, max_words: int = 7) -> Optional[tuple[str, str]]:
-    """Early first chunk for TTS: split an unfinished first sentence at a natural pause.
-
-    1) punctuation (, ; : dash) after >= min_words words, or
-    2) once >= max_words complete words have arrived, before the first break word
-       ("is", "that", "in", ...) at word >= min_words.
-    Returns (phrase, rest) or None to keep waiting (the sentence end then decides)."""
+def split_first_phrase(buffer: str, min_words: int = 3) -> Optional[tuple[str, str]]:
+    """Early first chunk for TTS: split an unfinished first sentence at punctuation (, ; : dash) after >= min_words
+    words, where a speaker pauses anyway (ARCHITECTURE.md §5.33). Returns (phrase, rest), or None: the first sentence
+    is then spoken whole. (A split before a break word such as "is" or "that" was faster but left an audible seam.)"""
     for m in _PHRASE_PUNCT.finditer(buffer):
         if len(buffer[:m.end()].split()) >= min_words:
             return buffer[:m.end()].strip(), buffer[m.end():]
-    words = list(re.finditer(r"\S+(?=\s)", buffer))          # complete words only
-    if len(words) < max_words:
-        return None
-    for w in words[min_words:]:
-        if w.group().lower() in BREAK_WORDS:
-            return buffer[:w.start()].strip(), buffer[w.start():]
     return None
 
 
@@ -1042,14 +1031,14 @@ class GpuWorker(threading.Thread):
     """
 
     def __init__(self, adapter: GemmaAdapter, tts: AneTts, budget: int = 1120, warm_image=None,
-                 first_chunk: str = "phrase", trim_silence: bool = True, mlx_cache_gb: float = 0.0,
+                 trim_silence: bool = True, mlx_cache_gb: float = 0.0,
                  policy: str = "p2", freshness: str = "B", fresh_ms: float = 300.0,
                  layers_per_piece: int = 2, min_read_interval_s: float = 0.0, duty_cap: float = 1.0,
                  history: bool = True, history_max_tokens: int = 2000, since_max_tokens: int = 1500):
         super().__init__(daemon=True, name="gpu-worker")
         self.adapter, self.tts, self.budget, self.warm_image = adapter, tts, budget, warm_image
-        assert first_chunk in ("phrase", "sentence") and policy in POLICIES and freshness in FRESHNESS
-        self.first_chunk, self.trim, self.mlx_cache_gb = first_chunk, trim_silence, mlx_cache_gb
+        assert policy in POLICIES and freshness in FRESHNESS
+        self.trim, self.mlx_cache_gb = trim_silence, mlx_cache_gb
         self.policy, self.freshness, self.fresh_ms = policy, freshness, fresh_ms
         self.layers_per_piece = layers_per_piece
         self.min_read_interval_s, self.duty_cap = min_read_interval_s, duty_cap
@@ -1501,7 +1490,7 @@ class GpuWorker(threading.Thread):
             text += delta
             buf += delta
             done, buf = split_complete_sentences(buf)
-            if self.first_chunk == "phrase" and chunks == 0 and not done:
+            if chunks == 0 and not done:
                 ph = split_first_phrase(buf)
                 if ph is not None:
                     speak(ph[0], mid_sentence=True)
@@ -1516,7 +1505,6 @@ class GpuWorker(threading.Thread):
             speak(buf.strip())
         r.update(answer=text.strip(), stop=self.adapter.last_stop if not self.cancel.is_set() else "cancel",
                  cap_hit=self.adapter.last_stop == "cap", sentences_spoken=sentences, chunks_spoken=chunks,
-                 first_chunk_mode=self.first_chunk,
                  cancelled=self.cancel.is_set())
         if self.history and text.strip():
             with self.cv:                               # the exchange goes into the context next

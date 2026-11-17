@@ -10,6 +10,10 @@
 //   --pipeline legacy|v3: FluidAudio's original seven-stage chain (default) or its hybrid ANE/GPU chain.
 //   kokoro-serve --models DIR [--noise gpu|cpu]   serve: one UTF-8 line of text in, then
 //        "@@" + JSON {"n", "seconds", "audio_s"} and n Float32 little-endian samples (24 kHz) out.
+//   kokoro-serve --models DIR --derive TEXT     the inflected words of TEXT resolved from their lexicon stems
+//        (Inflections.swift), as JSON; no models loaded.
+//   kokoro-serve --models DIR --phonemes TEXT   FluidAudio's phonemes for TEXT without and with those entries.
+//   --no-inflections: serve without them (FluidAudio's frontend as shipped).
 // Lines without the "@@" prefix are library logging.
 
 import CoreML
@@ -71,6 +75,20 @@ for (i, a) in CommandLine.arguments.enumerated() where a == "--stage" && i + 1 <
 }
 let version: KokoroAneVersion = arg("--pipeline") == "v3" ? .v3 : .legacy
 
+// Inflected forms of lexicon words, which FluidAudio's frontend would otherwise send to its G2P model.
+var inflections: Inflections? = nil
+if !CommandLine.arguments.contains("--no-inflections") && !CommandLine.arguments.contains("--download") {
+    do {
+        inflections = try Inflections.load(models: modelsDir)
+    } catch {
+        FileHandle.standardError.write("inflections unavailable (\(error)); FluidAudio's frontend as shipped\n".data(using: .utf8)!)
+    }
+}
+if let text = arg("--derive") {
+    emit(["entries": inflections?.entries(for: text) ?? [:]])
+    exit(0)
+}
+
 let t0 = Date()
 let fp0 = footprintMB()
 let tts = KokoroAneManager(variant: .english, defaultVoice: "af_heart", directory: modelsDir, computeUnits: units,
@@ -91,6 +109,25 @@ let tw = Date()
 _ = try await tts.synthesizeDetailed(text: "Okay.")
 let warmS = Date().timeIntervalSince(tw)
 let fpLoaded = footprintMB()
+
+var customLexicon: [String: String] = [:]
+/// Adds the entries `text` needs to FluidAudio's custom lexicon (only when there are new ones: setting it rebuilds the
+/// frontend). Entries stay for later lines; one per distinct inflected word that missed the lexicon.
+@MainActor func addInflections(_ text: String) async {
+    guard let inflections else { return }
+    let new = inflections.entries(for: text).filter { customLexicon[$0.key] == nil }
+    guard !new.isEmpty else { return }
+    customLexicon.merge(new) { a, _ in a }
+    await tts.setEnglishCustomLexicon(customLexicon)
+}
+
+if let text = arg("--phonemes") {
+    let before = try await tts.phonemes(for: text)
+    await addInflections(text)
+    let after = try await tts.phonemes(for: text)
+    emit(["text": text, "entries": customLexicon, "before": before, "after": after])
+    exit(0)
+}
 
 if let outPath = arg("--bench") {
     let out = URL(fileURLWithPath: outPath, isDirectory: true)
@@ -127,6 +164,7 @@ emit(["ready": true, "load_s": loadS, "warm_s": warmS, "footprint_mb": fpLoaded]
 while let line = readLine(strippingNewline: true) {
     if line.isEmpty { continue }
     let t = Date()
+    await addInflections(line)
     do {
         let r = try await tts.synthesizeDetailed(text: line)
         emit(["n": r.samples.count, "seconds": Date().timeIntervalSince(t), "audio_s": r.durationSeconds])

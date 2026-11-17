@@ -55,10 +55,9 @@ from recall import HINT, PAGES_HEAD
 from screen_store import KEY_LAYERS, Screen, quantize_int8
 
 IMAGE = "<|image|>"
-# The first phrase goes to Kokoro at a natural break once 5 words are in (it was 7), at least 3 in the phrase (was 4):
-# ~2 fewer tokens to decode and a shorter first synthesis (Kokoro 65-100 ms for 3-4 words, idle Neural Engine,
-# measured 2026-11-13), with the seam still at punctuation or before a break word ("is", "that", "in", ...).
-FIRST_MIN_WORDS, FIRST_MAX_WORDS = 3, 5
+# The answer's first chunk: the first sentence split early at punctuation after >= 3 words, else the whole sentence
+# (ARCHITECTURE.md §5.33; a split before a break word such as "is" was faster but left an audible seam).
+FIRST_MIN_WORDS = 3
 READ_FEATS = 4                   # image features of the last reads kept for keying (~5.5 MB each)
 MAX_BRANCHES = 2                 # exact caches kept: the current context and the runner-up (~0.1 GB each, estimate)
 
@@ -166,7 +165,7 @@ class TurnIO:
 
 
 class RecallBackend:
-    def __init__(self, adapter, store, tts=None, first_chunk: str = "phrase", trim_silence: bool = True,
+    def __init__(self, adapter, store, tts=None, trim_silence: bool = True,
                  history_max_tokens: int = 2000, k_parents: int = K_PARENTS, piece_dir: Optional[Path] = None,
                  screen_store=None, n_screens: int = 1):           # Andrew, 2026-11-11 (§5.13)
         self.a, self.store, self.tts = adapter, store, tts
@@ -178,7 +177,7 @@ class RecallBackend:
         self._tpl: dict = {}                            # (size, budget) -> the image's token block (ids, types, mask)
         self._null: dict = {}                           # screen-turn length -> null-query vectors per layer
         self.lay = K.Layout(adapter)
-        self.first_chunk, self.trim = first_chunk, trim_silence
+        self.trim = trim_silence
         self.history_max_tokens, self.k_parents = history_max_tokens, k_parents
         self.priors = dict(PRIORS)
         self.frames: dict[int, object] = {}             # frame id -> image, set by the worker before frame()
@@ -939,8 +938,8 @@ class RecallBackend:
                 text += delta
                 buf += delta
                 done, buf = split_complete_sentences(buf)
-                if self.first_chunk == "phrase" and chunks == 0 and not done:
-                    ph = split_first_phrase(buf, min_words=FIRST_MIN_WORDS, max_words=FIRST_MAX_WORDS)
+                if chunks == 0 and not done:
+                    ph = split_first_phrase(buf, min_words=FIRST_MIN_WORDS)
                     if ph is not None:
                         speak(ph[0], mid_sentence=True)
                         buf = ph[1]
