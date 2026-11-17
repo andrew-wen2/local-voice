@@ -8,8 +8,8 @@ pressure; Andrew, 2026-11-13),
 plus what the text index needs: time, page key, title, page-area OCR lines. No screenshot is stored: a frame's image
 is held only until it has been encoded.
 
-Lifecycle: the OCR thread decides a frame is kept (recall.FrameKeeper) -> the Neural Engine thread encodes it and
-puts the result here as pending -> the GPU thread keys it (recall_backend) and adds it -> it can be found and read.
+Lifecycle: the OCR thread decides a frame is kept (recall.FrameKeeper) -> the GPU thread encodes it in quiet time
+(or reuses the current-screen read's features), keys it (recall_backend) and adds it -> it can be found and read.
 Everything older than the horizon (an hour) is dropped, files included; the folder is deleted on close (Andrew's
 privacy decision, 2026-11-11: plain on disk, owner-only, gone on quit and after an hour).
 """

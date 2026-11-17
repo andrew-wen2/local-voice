@@ -33,6 +33,8 @@ The assistant keeps the last hour of your screen as the model's own internal sta
 - Everything that grows with history lives on disk, memory-mapped.
 - Bigger Metal command buffers cut the first token from 45 to 35 ms.
 
+More on how the code fits together: [docs/design.md](docs/design.md).
+
 ## Run it
 
 macOS on Apple silicon, Python 3.13.

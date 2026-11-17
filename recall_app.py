@@ -1,7 +1,7 @@
 """recall_app.py — recall mode's wiring as one object.
 
-The frames the app reads are OCR'd into pages and visits (recall.py), kept screens are encoded (Neural Engine when it
-can) and keyed, and the turn scheduler (scheduler.py, recall_worker.py) runs the GPU. While the key is held, partial
+The frames the app reads are OCR'd into pages and visits (recall.py), kept screens are encoded and keyed on the GPU
+in quiet time, and the turn scheduler (scheduler.py, recall_worker.py) runs the GPU. While the key is held, partial
 transcripts drive retrieval, exact page upgrades and the question prefill; release prefills what is left and answers.
 
 The inputs are injectable so the live app (`python app.py`) and the replay (`eval/replay_recall.py`) run the same
