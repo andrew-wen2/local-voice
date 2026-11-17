@@ -111,7 +111,7 @@ class Monitor(threading.Thread):
             return {}
         gb = lambda b: round(b / 1e9, 2)
         out = {"mem_peak_gb": gb(max(x["mem_total"] for x in s))}
-        for k in ("mem_app", "mem_asr", "mem_ane", "mem_tts"):
+        for k in ("mem_app", "mem_asr", "mem_tts"):
             v = [x[k] for x in s if x.get(k)]
             if v:
                 out[f"{k}_peak_gb"] = gb(max(v))
@@ -144,7 +144,7 @@ class Assistant:
         self.tts = make_tts(sandbox_profile=sandbox_profile, log_dir=LOGS)
         self.swap_weights = swap_weights
         self.worker: Optional[GpuWorker] = None
-        self.monitor = Monitor(lambda: {"app": os.getpid(), "asr": self.asr.pid(), "ane": self._ane_pid(),
+        self.monitor = Monitor(lambda: {"app": os.getpid(), "asr": self.asr.pid(),
                                         "tts": self.tts.pid()})
         self.startup: dict = {}
         self.ready = False
@@ -175,11 +175,6 @@ class Assistant:
             time.sleep(0.02)
         self.startup["total_s"] = round(time.perf_counter() - t_all, 2)
         self.ready = True
-
-    def _ane_pid(self):
-        """The Neural Engine encoder's child process (placement split), counted in the memory budget."""
-        ane = getattr(self.worker, "ane", None)
-        return ane.pid() if hasattr(ane, "pid") else None
 
     def stop(self):
         if self.worker:
@@ -624,9 +619,6 @@ def replay(args):
     summary.update(set=args.replay, budget=args.budget, policy=getattr(args, "policy", "p2"),
                    freshness=getattr(args, "freshness", "B"), startup=asst.startup, log=str(out),
                    reads_dropped=asst.worker.stats.get("reads_dropped"))
-    runner = asst.worker.ane_runner
-    summary.update(placement=getattr(args, "placement", "gpu"), ane_reads=asst.worker.stats.get("ane_reads"),
-                   ane_to_gpu=asst.worker.stats.get("ane_to_gpu"), ane=runner.stats if runner else None)
     print("SUMMARY", json.dumps(summary))
     return summary
 
@@ -664,9 +656,6 @@ def add_worker_args(ap):
     ap.add_argument("--layers-per-piece", type=int, default=2, help="text layers per read piece")
     ap.add_argument("--min-read-interval", type=float, default=0.0, help="rate cap: seconds between read starts (0 = off)")
     ap.add_argument("--duty-cap", type=float, default=1.0, help="reads may use at most this share of GPU time per minute (1 = off)")
-    ap.add_argument("--placement", choices=["gpu", "split"], default="gpu",
-                    help="image encoder: gpu (default) or split = P4, quiet-time encodes on the Neural Engine (ane_vision.py)")
-    ap.add_argument("--ane-root", default=None, help="folder of converted Core ML encoders (default models/vision-coreml)")
     ap.add_argument("--show-text", action="store_true",
                     help="print the transcript and answer in the terminal (the assistant can then read them on screen)")
     ap.add_argument("--hotkey", choices=["right_option", "right_command", "right_control", "fn", "none"],
@@ -683,7 +672,7 @@ def worker_opts(args) -> dict:
                 mlx_cache_gb=None if g("mlx_cache_gb", 0.0) < 0 else g("mlx_cache_gb", 0.0),
                 policy=g("policy", "p2"), freshness=g("freshness", "B"), fresh_ms=g("fresh_ms", 300.0),
                 layers_per_piece=g("layers_per_piece", 2), min_read_interval_s=g("min_read_interval", 0.0),
-                duty_cap=g("duty_cap", 1.0), placement=g("placement", "gpu"), ane_root=g("ane_root", None),
+                duty_cap=g("duty_cap", 1.0),
                 history={"on": True, "off": False}.get(g("history", "auto"), not g("replay", None)))
 
 

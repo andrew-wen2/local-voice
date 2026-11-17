@@ -1,15 +1,12 @@
 #!/bin/zsh
 # One-step setup for local-voice on an Apple silicon Mac (built and measured on a base M5, 16 GB, macOS 26).
 #
-#   ./setup.sh            # Python env, Swift helpers, default models (~6 GB download the first time)
-#   ./setup.sh --extras   # also the Neural Engine image encoder for kept screens (converted locally,
-#                         # takes a while; without it they are encoded on the GPU)
+#   ./setup.sh            # Python env, Swift helpers, models (~6 GB download the first time)
 #
 # Safe to re-run: every step skips what is already there. Everything the app runs offline afterwards;
 # downloads happen only here. Model revisions are pinned to the ones the results were measured with.
 set -e
 cd "${0:A:h}"
-EXTRAS=0; [[ "$1" == "--extras" ]] && EXTRAS=1
 step() { print -P "%B== $*%b" }
 
 [[ "$(uname -s)-$(uname -m)" == "Darwin-arm64" ]] || { echo "Needs macOS on Apple silicon."; exit 1; }
@@ -52,13 +49,8 @@ else   # Kokoro on the Neural Engine (the default speech output), via FluidAudio
   tools/parakeet/.build/release/kokoro-serve --models models/kokoro-coreml --download
 fi
 
-if (( EXTRAS )); then
-  step "Extras"
-  [[ -d models/vision-coreml ]] || .venv/bin/python ane_vision.py convert
-fi
-
 step "Check (model-free tests)"
-.venv/bin/python -m pytest -q tests --ignore=tests/test_ane_vision.py --ignore=tests/test_engine.py --ignore=tests/test_vision_qkv.py
+.venv/bin/python -m pytest -q tests --ignore=tests/test_engine.py --ignore=tests/test_vision_qkv.py
 
 cat <<'MSG'
 

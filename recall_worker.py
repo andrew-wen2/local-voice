@@ -377,17 +377,15 @@ class ScreenEncoder(threading.Thread):
     """Hands kept screens to the GPU thread for keying, in quiet time. Since 2026-11-13 (Andrew: memory under 4 GB) the
     image itself is handed over and the GPU encodes it while keying, or reuses the current-screen read's features when
     that frame was read: one image encoder instead of two (the Neural Engine copy's process held ~0.74 GB, mostly its 16
-    chunks' input/output buffers). With an `ane` given (experiments), kept screens are encoded on the Neural Engine
-    instead (§5.12: low power), one chunk at a time, waiting for quiet before each. A frame's image is held only until
-    it is encoded."""
+    chunks' input/output buffers). A frame's image is held only until it is encoded."""
 
-    def __init__(self, adapter, screens, quiet: Callable[[], bool], on_ready: Callable[[int], None], ane=None):
+    def __init__(self, screens, quiet: Callable[[], bool], on_ready: Callable[[int], None]):
         super().__init__(daemon=True, name="screen-encoder")
-        self.a, self.screens, self.quiet, self.on_ready, self.ane = adapter, screens, quiet, on_ready, ane
+        self.screens, self.quiet, self.on_ready = screens, quiet, on_ready
         self.cv = threading.Condition()
         self.q: list[tuple] = []
         self._stop = False
-        self.stats = {"encoded_ane": 0, "handed_to_gpu": 0, "errors": 0, "paused": 0}
+        self.stats = {"handed_to_gpu": 0}
 
     def submit(self, fid: int, image, meta: dict):
         with self.cv:
@@ -403,28 +401,7 @@ class ScreenEncoder(threading.Thread):
             self._stop = True
             self.cv.notify_all()
 
-    def _encode(self, pv):
-        """The Neural Engine encode, one chunk at a time, waiting for quiet before each (§6.1's rule, enforced per chunk
-        since M3, 2026-11-13): a turn needs the Neural Engine for speech recognition and Kokoro, and an encode that
-        had started before the talk key slowed the final transcription from ~70 ms to 300-850 ms. The hidden state
-        waits between chunks; nothing is redone. None if stopped."""
-        g = self.ane.encode_steps(pv)
-        while True:
-            with self.cv:
-                if not self.quiet():
-                    self.stats["paused"] += 1
-                while not self._stop and not self.quiet():
-                    self.cv.wait(0.05)
-                if self._stop:
-                    g.close()
-                    return None
-            try:
-                next(g)
-            except StopIteration as e:
-                return e.value
-
     def run(self):
-        import numpy as np
         while True:
             with self.cv:
                 while not self._stop and not (self.q and self.quiet()):
@@ -432,21 +409,6 @@ class ScreenEncoder(threading.Thread):
                 if self._stop:
                     return
                 fid, image, meta = self.q.pop(0)
-            tokens = None
-            if self._stop:
-                return
-            if self.ane is not None:
-                try:
-                    inp = self.a._inputs(image, self.a.screen_turn_prompt())
-                    pv = np.asarray(inp["pixel_values"], dtype=np.float32)
-                    if self.ane.has(pv.shape[2], pv.shape[3]):
-                        tokens = self._encode(pv)
-                except Exception:                      # fall back to the GPU for this frame
-                    self.stats["errors"] += 1
-            if tokens is not None:
-                self.screens.put_pending(fid, meta, tokens=tokens)
-                self.stats["encoded_ane"] += 1
-            else:
-                self.screens.put_pending(fid, meta, image=image)
-                self.stats["handed_to_gpu"] += 1
+            self.screens.put_pending(fid, meta, image)
+            self.stats["handed_to_gpu"] += 1
             self.on_ready(fid)

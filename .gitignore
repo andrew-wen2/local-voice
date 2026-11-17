@@ -5,7 +5,6 @@ captures/
 # large local files
 models/
 .venv/
-m0_ane/out/
 __pycache__/
 .pytest_cache/
 .DS_Store
@@ -16,3 +15,4 @@ eval/recall/sessions/*/html/
 eval/recall/sessions/*/png/
 eval/recall/sessions/*/ocr-*.json
 eval/recall/sessions/*/audio/
+m0_ane/out/

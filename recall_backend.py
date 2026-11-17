@@ -529,8 +529,8 @@ class RecallBackend:
 
     def _key_screen(self, fid: int):
         """Key a kept screen (quiet-time work): its features (the current-screen read's when that frame was read, else
-        encoded here on the GPU; from the Neural Engine only if one is given to the encoder), saved to disk; its screen turn through text layers up to the last key layer; image-token keys at KEY_LAYERS,
-        int8; and its score for the content-free query."""
+        encoded here on the GPU), saved to disk; its screen turn through text layers up to the last key layer;
+        image-token keys at KEY_LAYERS, int8; and its score for the content-free query."""
         def g():
             yield "plan_build"
             p = self.ss.take_pending(fid) if self.ss is not None else None
@@ -538,9 +538,7 @@ class RecallBackend:
                 return
             meta, a = p["meta"], self.a
             inp = self._inputs_like(meta["size"], a.screen_turn_prompt())
-            if p["tokens"] is not None:
-                _, feats = a.feats_from_tokens(inp, p["tokens"])
-            elif fid in self.read_feats:                # the GPU already encoded this frame for a read
+            if fid in self.read_feats:                # the GPU already encoded this frame for a read
                 feats = self.read_feats.pop(fid)
                 self.stats["feats_reused"] = self.stats.get("feats_reused", 0) + 1
             else:

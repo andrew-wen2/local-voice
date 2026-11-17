@@ -41,7 +41,7 @@ class RecallApp:
                  windows_fn: Callable[[], list] = windows, clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep, budget: int = 1120, swap_weights: bool = True,
                  freshness: str = "B", first_chunk: str = "phrase", trim_silence: bool = True,
-                 mlx_cache_gb: Optional[float] = 0.0, use_ane: bool = False, log_path: Optional[Path] = None,
+                 mlx_cache_gb: Optional[float] = 0.0, log_path: Optional[Path] = None,
                  show_text: bool = False, on_row: Optional[Callable[[dict], None]] = None, monitor: bool = True,
                  on_ui: Optional[Callable[[dict], None]] = None):
         self.grab_screen, self.grab_small, self.windows_fn = grab, grab_small, windows_fn
@@ -49,11 +49,11 @@ class RecallApp:
         self.speaker, self.mic = speaker, mic
         self.budget, self.swap_weights, self.freshness = budget, swap_weights, freshness
         self.first_chunk, self.trim_silence, self.mlx_cache_gb = first_chunk, trim_silence, mlx_cache_gb
-        self.use_ane, self.log_path, self.show_text, self.on_row = use_ane, log_path, show_text, on_row
+        self.log_path, self.show_text, self.on_row = log_path, show_text, on_row
         self.want_monitor = monitor
         self.on_ui = on_ui                               # caption events for the menu bar panel (menubar.py)
         self.asr = self.tts = self.store = self.screens = self.worker = None
-        self.ane = self.encoder = self.ocr = self.watcher = self.monitor = None
+        self.encoder = self.ocr = self.watcher = self.monitor = None
         self.before: dict = {}
         self.turn: dict = {}
         self.seq = 0
@@ -95,14 +95,8 @@ class RecallApp:
         if self.worker.error:
             raise self.worker.error
         self._ui("dirs", paths=self.data_dirs())        # before anything is kept, so a kill during loading can't leak them
-        if self.use_ane:            # off (Andrew, 2026-11-13): the Neural Engine copy held ~0.74 GB; kept screens use the GPU
-            try:
-                from ane_vision import OUT, AneProcess
-                self.ane = AneProcess(OUT).load()
-            except Exception as e:
-                print(f"(Neural Engine encoder unavailable, kept screens are encoded on the GPU: {e!r})", flush=True)
         quiet = lambda: not self.worker.turn_active
-        self.encoder = ScreenEncoder(adapter, self.screens, quiet=quiet, on_ready=self.worker.key_frame, ane=self.ane)
+        self.encoder = ScreenEncoder(self.screens, quiet=quiet, on_ready=self.worker.key_frame)
         self.encoder.start()
         self.ocr = Ocr(self.store, quiet=quiet, on_visit_end=self.worker.visit_ended,
                        t0=self.store.start.timestamp(), on_keep=self.encoder.submit, on_unit_text=self.screens.add_lines)
@@ -140,9 +134,8 @@ class RecallApp:
         return round(time.perf_counter() - t, 1)
 
     def _pids(self) -> dict:
-        ane_proc = getattr(self.ane, "proc", None)
         return {"app": os.getpid(), "asr": self.asr.pid() if self.asr else None,
-                "tts": self.tts.pid() if self.tts else None, "ane": ane_proc.pid if ane_proc else None}
+                "tts": self.tts.pid() if self.tts else None}
 
     def stop(self):
         for x in (self.watcher, self.ocr, self.encoder):
@@ -151,8 +144,6 @@ class RecallApp:
         if self.worker is not None:
             self.worker.stop()
             self.worker.join(10)
-        if self.ane is not None:
-            self.ane.close()
         if self.screens is not None:
             self.screens.close()                         # kept screens deleted on quit
         if self.tts is not None:

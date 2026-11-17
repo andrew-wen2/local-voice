@@ -58,16 +58,16 @@ class ScreenStore:
         os.chmod(self.dir, 0o700)
         self.horizon_s = horizon_s
         self.lock = threading.RLock()
-        self.pending: dict[int, dict] = {}        # fid -> {"meta": {...}, "tokens": ndarray | None, "image": PIL | None}
+        self.pending: dict[int, dict] = {}        # fid -> {"meta": {...}, "image": PIL}
         self.screens: dict[int, Screen] = {}
         self.version = 0                          # bumps when the set of ready screens changes
         self._bm25 = None
         self._more: dict[int, list] = {}          # fid -> text of dropped frames waiting for that screen to be ready
 
     # -- the pipeline
-    def put_pending(self, fid: int, meta: dict, tokens=None, image=None):
+    def put_pending(self, fid: int, meta: dict, image):
         with self.lock:
-            self.pending[fid] = {"meta": meta, "tokens": tokens, "image": image}
+            self.pending[fid] = {"meta": meta, "image": image}
 
     def take_pending(self, fid: int) -> Optional[dict]:
         with self.lock:
