@@ -1,17 +1,17 @@
 """screen_store.py — kept screens as memory.
 
 A kept screen is its vision features (the encoder's output, ~1,066 image tokens; written to disk, owner-only, int8 with a
-scale per token: Andrew's default, 2026-11-11, ~2.7 MB instead of ~5.5 MB a screen) and its
+scale per token: ~2.7 MB instead of ~5.5 MB a screen) and its
 retrieval keys (image-token keys of full-attention layers 11 and 17, int8 with a scale per key; written to disk too
 and memory-mapped, so the app's memory doesn't grow with the hour: macOS keeps them in spare RAM and drops them under
-pressure; Andrew, 2026-11-13),
+pressure),
 plus what the text index needs: time, page key, title, page-area OCR lines. No screenshot is stored: a frame's image
 is held only until it has been encoded.
 
 Lifecycle: the OCR thread decides a frame is kept (recall.FrameKeeper) -> the GPU thread encodes it in quiet time
 (or reuses the current-screen read's features), keys it (recall_backend) and adds it -> it can be found and read.
-Everything older than the horizon (an hour) is dropped, files included; the folder is deleted on close (Andrew's
-privacy decision, 2026-11-11: plain on disk, owner-only, gone on quit and after an hour).
+Everything older than the horizon (an hour) is dropped, files included; the folder is deleted on close (plain on
+disk, owner-only, gone on quit and after an hour).
 """
 from __future__ import annotations
 

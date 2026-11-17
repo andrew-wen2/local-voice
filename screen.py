@@ -1,11 +1,11 @@
 """screen.py — capture the main display and decide when the screen has really changed.
 
-Capture (review D13): `screencapture -x -m -t jpg` into a private 0700 temp folder; the file is
-loaded into memory and deleted immediately (D4). Images are never saved or logged.
-Change filter (D20): any pixel change outside a masked menu-bar status area (clock, battery,
+Capture: `screencapture -x -m -t jpg` into a private 0700 temp folder; the file is
+loaded into memory and deleted immediately. Images are never saved or logged.
+Change filter: any pixel change outside a masked menu-bar status area (clock, battery,
 Wi-Fi) counts; once a change is seen, wait for the screen to settle (no change for 0.3 s),
 but hand the frame over at most 3 s after the first change even if it never settles.
-Permission (D5): `has_screen_permission()` asks CoreGraphics without triggering a prompt.
+Permission: `has_screen_permission()` asks CoreGraphics without triggering a prompt.
 """
 
 from __future__ import annotations
@@ -191,7 +191,7 @@ class StreamCapturer:
     """ScreenCaptureKit, in process: one stream of the main display, scaled by macOS
     to the change gate's size (1/CELL_SCALE), delivered only when something on screen changed, at most every
     `interval_s`; and a full-resolution screenshot (SCScreenshotManager) only when a frame is handed over.
-    No files, no process per poll. Frames stay in memory (D4).
+    No files, no process per poll. Frames stay in memory.
 
       cap = StreamCapturer().start()
       ScreenWatcher(on_frame, grab=cap.grab, grab_small=cap.grab_small)

@@ -1,4 +1,4 @@
-"""Tests for screen.py: change filter (D20), settle + max delay, privacy of captures (D4)."""
+"""Tests for screen.py: change filter, settle + max delay, privacy of captures."""
 import os
 import stat
 from pathlib import Path

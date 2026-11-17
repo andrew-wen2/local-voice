@@ -266,7 +266,7 @@ class RecallWorker(threading.Thread):
     def _retrieve(self, text: str) -> tuple:
         """The memory slots for this (partial) question, in context order: kept screens (found by text and Gemma's
         keys, oldest first), the pages turn's opener, then pages [(page key, version, lines shown)], oldest first.
-        The page cap counts the timeline and the pages header, as eval/recall/rag_arm.py does; screens come on top
+        The page cap counts the timeline and the pages header, as the offline evaluation does; screens come on top
         of it, as in the reading test. Cached by text for the turn: the final transcript is usually the
         last partial."""
         if text not in self._found:
@@ -276,7 +276,7 @@ class RecallWorker(threading.Thread):
     def _retrieve_alt(self, text: str):
         """The runner-up context for this (partial) question: the next-best kept screen, with its own view as the
         memory, laid out as _retrieve lays out the best one; None if there is none. The scheduler computes it while
-        the GPU would otherwise idle (M3, 2026-11-13)."""
+        the GPU would otherwise idle."""
         if text not in self._found:
             self._found[text] = self._find(text)
         return self._found[text][1]
@@ -312,7 +312,7 @@ class RecallWorker(threading.Thread):
 
     def _retrieve_steps(self, text: str):
         """(best, runner-up) for a partial transcript, as GPU pieces the scheduler interleaves with page work (its
-        Retrieve job, M3 2026-11-15). Same result as _retrieve/_retrieve_alt, and fills the same cache."""
+        Retrieve job). Same result as _retrieve/_retrieve_alt, and fills the same cache."""
         yield "rprep"
         if text not in self._found:
             self._found[text] = yield from self._find_steps(text)
@@ -332,7 +332,7 @@ class RecallWorker(threading.Thread):
         find = getattr(self.backend, "find_screens", None)
         if steps is None and find is None:            # backends without kept screens (tests)
             return tuple(self.store.pick(text, self.cap, self._count, used=used)), None
-        # Andrew, 2026-11-12: the memory text is the top kept screen's own view text, up to the same
+        # The memory text is the top kept screen's own view text, up to the same
         # budget; whole pages only while no screen has been kept yet.
         fids = (yield from steps(text)) if steps is not None else find(text)
         yield "rlay"
@@ -361,10 +361,10 @@ WIRED_HEADROOM_GB = 0.25          # on top of the weights (the prefix); wired me
 
 
 def wire_weights() -> float:
-    """Keep MLX's memory resident (M3, 2026-11-13). Background work in quiet time runs text layers 0-23 only, so for an
+    """Keep MLX's memory resident. Background work in quiet time runs text layers 0-23 only, so for an
     hour the KV-shared layers (24-41) are untouched and macOS paged them out: the first answer after an hour took
     3-3.8 s to its first token instead of ~0.15 s. Wired up to the weights plus headroom (buffers allocated first, the
-    weights, are wired first), below the system's recommended working set. "No swapping of the assistant" (M3 bar).
+    weights, are wired first), below the system's recommended working set. "No swapping of the assistant."
     Returns the limit in GB."""
     info = mx.device_info()
     want = mx.get_active_memory() + int(WIRED_HEADROOM_GB * 1e9)
@@ -374,7 +374,7 @@ def wire_weights() -> float:
 
 
 class ScreenEncoder(threading.Thread):
-    """Hands kept screens to the GPU thread for keying, in quiet time. Since 2026-11-13 (Andrew: memory under 4 GB) the
+    """Hands kept screens to the GPU thread for keying, in quiet time. To keep memory under 4 GB, the
     image itself is handed over and the GPU encodes it while keying, or reuses the current-screen read's features when
     that frame was read: one image encoder instead of two (the Neural Engine copy's process held ~0.74 GB, mostly its 16
     chunks' input/output buffers). A frame's image is held only until it is encoded."""

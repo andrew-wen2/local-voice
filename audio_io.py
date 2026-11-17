@@ -1,10 +1,10 @@
 """audio_io.py — microphone and speaker.
 
 Mic: records 16 kHz mono while a push-to-talk turn is open; flags near-silent turns
-(possible missing Microphone permission or muted mic; review D5).
-Speaker: a playback queue fed by the GPU worker; `clear()` empties it on interrupt (D6).
-First audio is timestamped when the first audible sample is handed to the queue (same
-definition as the harness); the output device's own latency is reported separately.
+(possible missing Microphone permission or muted mic).
+Speaker: a playback queue fed by the GPU worker; `clear()` empties it on interrupt.
+First audio is timestamped when the first audible sample is handed to the queue (the
+same definition the latency numbers use); the output device's own latency is reported separately.
 """
 
 from __future__ import annotations

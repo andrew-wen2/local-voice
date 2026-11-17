@@ -6,12 +6,12 @@ answer. Other threads only hand it work.
 
 Pieces:
   - GemmaAdapter: load / set_budget / read_screen(image) -> Snapshot / generate(cache, ids)
-      * fixed screen/question split (review D2): the screen prefix is the chat template
+      * fixed screen/question split: the screen prefix is the chat template
         up to a fixed "Question:" marker after the image; the question is its own suffix.
-      * spare cache copy prepared in the background (D12).
-      * answers stop at the 3rd sentence or 120 tokens (D9); cancel checked every token (D6).
+      * spare cache copy prepared in the background.
+      * answers stop at the 3rd sentence or 120 tokens; cancel checked every token.
   - AneTts: Kokoro on the Neural Engine in a helper process, one sentence at a time, cancel checked per
-    sentence (D6). Its leading silence is trimmed; the first chunk is split early at a pause (split_first_phrase).
+    sentence. Its leading silence is trimmed; the first chunk is split early at a pause (split_first_phrase).
   - GpuWorker: the scheduler. Answer jobs first; screen reads run in pieces and pause for
     answers (policy p2), or follow the MVP baseline (p0) / wait-for-read (p1) for comparison.
 """
@@ -29,14 +29,14 @@ from typing import Callable, Iterator, Optional
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-# M3 (2026-11-16): bigger Metal command buffers. MLX spends ~16 ms of CPU encoding a forward pass's ~2,500 kernels
+# Bigger Metal command buffers. MLX spends ~16 ms of CPU encoding a forward pass's ~2,500 kernels
 # and sends them to the GPU in batches; with these, 5 alternating processes each: the answer's first token 45 -> 35
 # ms, the 7th 213 -> 208 ms, same tokens (only how work is batched to the GPU changes). Read when MLX first makes
 # its GPU device, so set before MLX is used.
 os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "400")
 os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "200")
 
-# M3: keep torch out of the app process. transformers (Gemma's processor) and spaCy's thinc (Kokoro's
+# Keep torch out of the app process. transformers (Gemma's processor) and spaCy's thinc (Kokoro's
 # phonemizer) both treat it as optional; a None entry makes `import torch` fail and find_spec return
 # None. LV_ALLOW_TORCH=1 undoes it.
 if os.environ.get("LV_ALLOW_TORCH") != "1":
@@ -60,7 +60,7 @@ SPOKEN_INSTRUCTION = (
 )
 # Recall mode: earlier screens and pages sit above the current screen, so "the image above" is
 # ambiguous; say which image is now. Same answer rules as SPOKEN_INSTRUCTION.
-RECALL_INSTRUCTION = (            # Andrew, 2026-11-12: no screen talk unless asked, no images, short
+RECALL_INSTRUCTION = (            # no screen talk unless asked, no images, short
     "You are a helpful voice assistant. The image just above is the user's current screen, what is on screen right "
     "now; earlier screens and pages above it are no longer on screen. Use them only when the question is about what is "
     "or was on the user's screen; answer any other question directly, without bringing up the screen. Never mention "
@@ -296,7 +296,7 @@ class GemmaAdapter:
         self.path = Path(path)
         self.instruction = instruction
         self.model = self.processor = None
-        # M3 (2026-11-13, Andrew: app + helpers <= 4.0 GB): no Hugging Face tokenizer or processor in the process
+        # To keep app + helpers under 4 GB: no Hugging Face tokenizer or processor in the process
         # (~0.30 GB). lean_tok.py's tokenizer (exact ids, ~40 MB), the chat template rendered once at build time, and
         # the image processor alone. Built by `python -m lean_tok build` (a separate process); without those files,
         # the processor path is used.
@@ -306,7 +306,7 @@ class GemmaAdapter:
         # Don't build Gemma's audio encoder (0.61 GB; Parakeet does speech).
         self.skip_audio = skip_audio
         # During prefill, run the 18 KV-shared layers only for the last token. They store
-        # no cache, so the snapshot is bit-identical (checked 2026-11-06). No speed gain in reads (S0): MLX is
+        # no cache, so the snapshot is bit-identical (checked 2026-11-06). No speed gain in reads: MLX is
         # lazy and a read evaluates only the cache, so those layers never ran anyway. Kept as a guard.
         self.skip_shared = skip_shared
         # Read the 1.59 GB per-layer embedding table's rows from the model file on demand.
@@ -485,7 +485,7 @@ class GemmaAdapter:
         self._use[part] += 1
         other = "head" if part == "vision" else "vision"
         if self._resident[other] and self._use[other] == 0:
-            self._unload_part(other)                    # first, so the two are never in memory together (M3)
+            self._unload_part(other)                    # first, so the two are never in memory together
         if not self._resident[part]:
             self._load_part(part)
 
@@ -549,7 +549,7 @@ class GemmaAdapter:
         """Greedy decode after feeding `ids` into `cache` (mutated). Yields text deltas.
         Stops at a stop token, `max_sentences` sentence ends, `max_tokens`, or `cancel`.
         Sets self.last_stop to 'eos' | 'sentences' | 'cap' | 'cancel'.
-        Pipelined (M3, 2026-11-15): the next token's forward pass is queued on the GPU before this token's CPU work
+        Pipelined: the next token's forward pass is queued on the GPU before this token's CPU work
         (detokenizing, the stop checks, the caller's phrase logic, other pieces in between), so that work hides
         behind the GPU instead of adding to every token. Same tokens (greedy, same graph); the cache ends one token
         past the stop (callers clone it or drop it)."""
@@ -602,7 +602,7 @@ class GemmaAdapter:
 
     def exchange_ids(self, q: str, a: str, first_after_screen: bool = False, older: bool = False) -> list[int]:
         """older=True: an exchange about a previous screen, moved before the current screen turn. It is
-        marked as earlier: in eval/history_eval.py (2026-11-06) this cut copying of a wrong earlier answer
+        marked as earlier: in a 20-question test this cut copying of a wrong earlier answer
         from 2/20 to 1/20 and kept cross-screen recall at 5/5 (a caution in the instructions made both worse)."""
         if first_after_screen:                     # closes the open screen turn ("…Question:")
             return self.text_ids(f" {q}{TURN_END}{TURN_MODEL}{a}{TURN_END}")
@@ -718,12 +718,12 @@ class GemmaAdapter:
 
         split="layers" (default, bit-exact): all tokens go through text layers 0-23, `layers_per_piece`
         at a time, and the read stops there. Layers 24-41 share earlier layers' KV and store nothing,
-        so a snapshot never needs them (G1, taken one step further: no shared layers, no logits).
+        so a snapshot never needs them (the KV-shared-layer skip above, one step further: no shared layers, no logits).
         split="tokens": the usual chunked prefill, `chunk` tokens at a time. Changes rounding
         (different matrix shapes): 17/20 answers word-identical at 1120 on 2026-11-06, same content.
 
         The vision and text loops mirror mlx_vlm gemma4 VisionModel.__call__ (fixed-size image
-        branch) and Gemma4TextModel.__call__; eval/exactness.py and tests check the result."""
+        branch) and Gemma4TextModel.__call__; tests check the result."""
         import math
         t0 = time.time()
         inp = self._inputs(image, self.prefix_prompt())
@@ -853,7 +853,7 @@ class AneTts:
         self.sample_rate = 24000
         self.startup: dict = {}
         self.failures: list[dict] = []
-        self._req = threading.Lock()                    # one request at a time (TTS runs on its own thread, M3)
+        self._req = threading.Lock()                    # one request at a time (TTS runs on its own thread)
 
     def available(self) -> bool:
         return self.binary.exists() and (self.model_dir / "kokoro-82m-coreml").exists()

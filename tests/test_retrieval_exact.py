@@ -1,4 +1,4 @@
-"""Retrieval made faster without changing a value (M3, 2026-11-15): the question pass stops at the last key layer and
+"""Retrieval made faster without changing a value: the question pass stops at the last key layer and
 runs in pieces, and key scoring is one matmul with the max taken before the cast and scale. Both must equal the code
 they replaced bit for bit. Needs the model files (runs a short pass on the GPU)."""
 from pathlib import Path
@@ -92,7 +92,7 @@ def test_scores_are_identical(be):
 
 
 def test_rewound_question_prefill_is_exact(be):
-    """M3 (2026-11-15): a question prefill whose last words changed is cut back to its longest still-valid prefix
+    """A question prefill whose last words changed is cut back to its longest still-valid prefix
     (window layers restored from a snapshot) and continued; the cache must equal one that never took the wrong turn,
     built with the same prefill steps."""
     import recall_backend as RB

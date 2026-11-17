@@ -1,4 +1,4 @@
-"""Tests for app.py: readiness gate (D8), permission exit + near-silent flag (D5), memory (D19)."""
+"""Tests for app.py: readiness gate, permission exit + near-silent flag, memory."""
 import os
 import types
 

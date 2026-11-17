@@ -151,7 +151,7 @@ class Partials(threading.Thread):
 
     A partial also runs as soon as speech stops (`settle_s` of silence after the last voiced block that the last
     partial didn't reach), not only on the `every_s` tick: when you pause before releasing the key, the last partial
-    then covers everything and the final transcription is skipped (M3, 2026-11-13)."""
+    then covers everything and the final transcription is skipped."""
 
     def __init__(self, asr, get_audio, voiced_until, on_partial, every_s: float = 0.3, min_new_s: float = 0.25,
                  min_audio_s: float = 0.5, sr: int = 16000, settle_s: float = 0.1, tick_s: float = 0.05):

@@ -44,7 +44,7 @@ def test_drop_in_modules_match_the_originals():
 
 
 def test_two_rows_are_each_bit_identical_to_one_row():
-    """M3 (2026-11-15), kernel lever 1: 2 rows of x share each weight block load (18 vs 25 ms over all 342 matmuls,
+    """2 rows of x share each weight block load (18 vs 25 ms over all 342 matmuls,
     cold weights); every output row must equal the one-token kernel on that row alone, bit for bit."""
     import mlx.core as mx
     import numpy as np

@@ -2,8 +2,6 @@
 
 **A voice assistant that remembers your screen.** Hold a key and ask, *"how much was that kettle I was looking at?"*, about a tab you closed 40 minutes ago. It answers out loud in about half a second, fully offline, on a base 16 GB MacBook.
 
-<!-- Demo GIF goes here (menu bar captions, closed-tab recall). -->
-
 Three models run on one laptop, in about 4 GB:
 - a vision-language model (Gemma 4 E4B) on the GPU;
 - speech recognition (Parakeet) on the Neural Engine;

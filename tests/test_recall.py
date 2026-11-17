@@ -119,7 +119,7 @@ def test_partials_and_final_from_partial():
 
 
 def test_a_partial_runs_when_speech_stops_so_the_final_is_skipped():
-    """M3 (2026-11-13): 0.1 s after the last voiced block, a partial runs even with less than min_new of new audio,
+    """0.1 s after the last voiced block, a partial runs even with less than min_new of new audio,
     so with a pause before key up the last partial covers every voiced sample (no final transcription)."""
     audio, voiced, got = [np.zeros(16000, np.float32)], [16000], []
     p = Partials(FakeAsr(), lambda: audio[0], lambda: voiced[0], got.append, every_s=10.0, tick_s=0.01)
@@ -193,7 +193,7 @@ def test_worker_turn_on_the_simulated_backend():
     w.stop()
     w.join(5)
     r = io.result
-    # the partial is retrieved only if the loop reaches it before key up (M3 2026-11-15: Retrieve job); the final always
+    # the partial is retrieved only if the loop reaches it before key up (the Retrieve job); the final always
     assert r["cancelled"] is False and r["release_s"] >= 0 and r["retrievals"] in (1, 2)
     assert ("build", ("A", 1, 1)) in be.calls and ("build", ("B", 1, 1)) in be.calls
     assert w.sched.ex_done == 1

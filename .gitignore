@@ -1,4 +1,4 @@
-# private data never leaves this Mac (review D4)
+# private data never leaves this Mac
 logs/
 captures/
 *.capture.*
@@ -16,7 +16,7 @@ eval/recall/sessions/*/png/
 eval/recall/sessions/*/ocr-*.json
 eval/recall/sessions/*/audio/
 m0_ane/out/
-# benchmarks and experiments stay on this Mac, off GitHub (Andrew, 2026-11-16)
+# benchmarks and experiments stay on this Mac, off GitHub
 eval/
 harness/
 m0_screen/
@@ -25,3 +25,4 @@ tests/test_harness.py
 tests/test_recall_bench.py
 tests/test_offline_replay.py
 tests/test_scoring.py
+tests/test_local_data.py

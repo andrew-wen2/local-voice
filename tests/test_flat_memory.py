@@ -1,4 +1,4 @@
-"""Memory doesn't grow during use (Andrew, 2026-11-13): what scales with the hour lives on disk, without the model.
+"""Memory doesn't grow during use: what scales with the hour lives on disk, without the model.
 
 Stored pieces don't pin the cache they were cut from, round-trip through disk exactly, and go away with their page;
 kept screens' keys are memory-mapped and their files go away when they expire.

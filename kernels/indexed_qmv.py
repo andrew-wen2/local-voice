@@ -2,7 +2,7 @@
 
 The idea (lossless). MLX stores each group of 64 weights with its own bf16 scale and bf16 bias: 32 bits of
 metadata per 64 four-bit codes, 0.29 GB of Gemma's 2.6 GB of text weights. But each weight tensor uses only
-928-5,179 distinct (scale, bias) pairs across up to 163,840 groups (measured, eval/kernels/weight_entropy.py).
+928-5,179 distinct (scale, bias) pairs across up to 163,840 groups (measured).
 So store, per tensor, a table of its distinct pairs, and per group a 16-bit index into it: 16 bits instead
 of 32, the same values bit for bit.
 
@@ -100,7 +100,7 @@ _kernel = mx.fast.metal_kernel(name="indexed_qmv_4bit_g64", input_names=["w", "i
                                output_names=["y"], source=_SOURCE)
 
 
-# ---------------------------------------------------------------- a few rows at once (M3, 2026-11-15)
+# ---------------------------------------------------------------- a few rows at once
 # Kernel lever 1. For 2+ input rows (a question's last words, a retrieval's question pass, the question prefill),
 # indexed_matmul used to rebuild every matrix's full scales and biases from the index on each call (table[idx], ~0.3
 # GB of metadata written and read per forward pass) and then run MLX's multi-row kernel, which at these sizes is far

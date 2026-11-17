@@ -2,7 +2,7 @@
 
 Frames the app reads (screen.ScreenWatcher) -> OCR (Apple Vision) -> pages and visits -> the context text.
 
-  page key   the eval's rules, unchanged (moved here from eval/real/retrieval.py so the app and the eval share them):
+  page key   shared with the offline evaluation, so both see the same pages:
              browsers by tab title, other apps by window; text = OCR lines inside the front window, below a
              browser's address bar. A frame whose front window changed across the grab is skipped.
   visits     a run of frames on one page; it ends when a frame from another page arrives. Each frame lasts
@@ -11,7 +11,7 @@ Frames the app reads (screen.ScreenWatcher) -> OCR (Apple Vision) -> pages and v
              last finished visit. The page on screen now is in the context as the screen read, not from here.
              Every page has a version that goes up when a visit of it ends: its text and its time header change
              then, and so must its stored KV piece.
-  context    the text layout of eval/recall/rag_arm.py, unchanged (moved here, rag_arm imports it): the timeline
+  context    shared with the offline evaluation too: the timeline
              (one line per finished visit), then the pages slot: retrieved whole pages under a token cap, best
              BM25 first until the cap, shown oldest first, each under a time header.
 
@@ -326,7 +326,7 @@ class Store:
             return "\n\n" + self.head(key) + p.text(p.blocks if n_lines is None else p.blocks[:n_lines])
 
     def set_view(self, fid: int, screen) -> str:
-        """A kept screen's view text as a memory slot (Andrew, 2026-11-12): the page-area lines of the kept frame
+        """A kept screen's view text as a memory slot: the page-area lines of the kept frame
         and the frames it stands in for, headed like its page (time, title, address). Its version bumps when the text
         grows (dropped frames keep arriving). Returns its key "view:<fid>"."""
         vk = f"view:{fid}"
@@ -410,7 +410,7 @@ class FrameKeeper:
 
 def _pack(a):
     """A page's last kept thumbnail, zlib-compressed (lossless): ~1.1 MB each as an array, one per page, grew with
-    the hour (M3, 2026-11-13)."""
+    the hour."""
     import zlib
     if a is None:
         return None
@@ -430,7 +430,7 @@ def _unpack(p):
 
 def ocr_image(img) -> tuple[list[str], list[list[float]]]:
     """Accurate-mode OCR of a PIL screenshot (device pixels, 2 per point). Returns (lines, boxes in points:
-    x, y from the top-left, w, h), as eval/real/ocr.py writes them."""
+    x, y from the top-left, w, h)."""
     import objc
     import Quartz
     import Vision
@@ -439,7 +439,7 @@ def ocr_image(img) -> tuple[list[str], list[list[float]]]:
     W, H = rgb.size
     # The provider owns a copy of the pixels (CFData) and every Objective-C object made here is released when the pool
     # drains. CGDataProviderCreateWithData on Python bytes, or no pool on this long-lived thread, leaked one full
-    # RGBA frame (~24 MB at 3024x1964) per call (M3 baseline, 2026-11-13).
+    # RGBA frame (~24 MB at 3024x1964) per call.
     with objc.autorelease_pool():
         data = NSData.dataWithBytes_length_(rgb.tobytes(), W * H * 4)
         provider = Quartz.CGDataProviderCreateWithCFData(data)

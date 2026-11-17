@@ -4,7 +4,7 @@ The frames the app reads are OCR'd into pages and visits (recall.py), kept scree
 in quiet time, and the turn scheduler (scheduler.py, recall_worker.py) runs the GPU. While the key is held, partial
 transcripts drive retrieval, exact page upgrades and the question prefill; release prefills what is left and answers.
 
-The inputs are injectable so the live app (`python app.py`) and the replay (`eval/replay_recall.py`) run the same
+The inputs are injectable so the live app (`python app.py`) and an offline replay run the same
 code: `grab` / `grab_small` (the screen), `windows_fn` (the window list), `mic` (audio_io.Mic or anything with its
 interface), `speaker` (audio_io.Speaker or a sink), and `clock` / `sleep` for the screen watcher.
 """
@@ -120,7 +120,7 @@ class RecallApp:
 
     def _warm_up(self) -> float:
         """One silent question through the answer path (retrieval, assembly, prefill, decode, Kokoro) before the first
-        real one, so first-use costs are paid at startup (M3, 2026-11-13). Its audio is dropped; it isn't kept in the
+        real one, so first-use costs are paid at startup. Its audio is dropped; it isn't kept in the
         conversation. Returns seconds."""
         t = time.perf_counter()
         io = TurnIO(emit_audio=lambda samples, sr: None, mark=lambda name: None, warmup=True)

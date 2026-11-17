@@ -1,23 +1,14 @@
 """Tests for engine.py.
 
-Fast (default): stop rule, sentence splitting, GPU worker job policy with a fake model.
-Slow (-m slow): real Gemma 4 E4B — fixed split joins exactly, cached == uncached on the
-20 M0 screen questions (review D2), cancel stops within one token (D6).
+Stop rule, sentence splitting, first-phrase split, silence trim, GPU worker job policy with a fake model.
 """
-import json
-import threading
 import time
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 import engine
 from engine import count_sentences, split_complete_sentences
-
-ROOT = Path(__file__).resolve().parents[1]
-M0 = ROOT / "m0_screen"
-M0_INSTRUCTION = "Answer the question about this screenshot. Reply with only the answer, no explanation."
 
 
 # ---------------------------------------------------------------- fast
@@ -314,69 +305,6 @@ def test_duty_cap_defers_reads_but_not_reads_an_answer_needs(monkeypatch):
     assert job.done.wait(5)
     assert job.result["frame_id"] == 2
     w.stop()
-
-
-# ---------------------------------------------------------------- slow (real model)
-
-@pytest.fixture(scope="module")
-def gemma():
-    if not (M0 / "questions.json").exists():
-        pytest.skip("needs the local reading set (m0_screen/, not on GitHub)")
-    a = engine.GemmaAdapter(instruction=M0_INSTRUCTION).load()
-    a.set_budget(560)
-    return a
-
-
-def _m0_questions():
-    return json.loads((M0 / "questions.json").read_text())
-
-
-@pytest.mark.slow
-def test_fixed_split_joins_exactly(gemma):
-    """prefix tokens + question tokens == tokens of the full prompt, for every M0 question."""
-    by_screen = {}
-    for q in _m0_questions():
-        by_screen.setdefault(q["screen"], []).append(q)
-    for screen, qs in by_screen.items():
-        img = str(M0 / f"screens/{screen}.png")
-        pre = gemma.prefix_ids(img)
-        for q in qs:
-            assert pre + gemma.suffix_ids(q["question"]) == gemma.full_ids(img, q["question"]), q["question"]
-
-
-@pytest.mark.slow
-def test_cached_answers_match_uncached(gemma):
-    """Review D2: the pre-read path must give the same answers as the normal one-pass path."""
-    mismatches, rows = [], []
-    by_screen = {}
-    for q in _m0_questions():
-        by_screen.setdefault(q["screen"], []).append(q)
-    for screen, qs in by_screen.items():
-        img = str(M0 / f"screens/{screen}.png")
-        snap = gemma.read_screen(img)
-        for q in qs:
-            a = gemma.answer_cached(snap, q["question"], max_tokens=40)
-            b = gemma.answer_uncached(img, q["question"], max_tokens=40)
-            rows.append((q["question"], a, b))
-            if a.strip() != b.strip():
-                mismatches.append((q["question"], a, b))
-    print("\n".join(f"{q[:40]!r}: cached={a!r} uncached={b!r}" for q, a, b in rows))
-    assert not mismatches, mismatches
-
-
-@pytest.mark.slow
-def test_cancel_stops_within_one_token(gemma):
-    img = str(M0 / "screens/doc.png")
-    snap = gemma.read_screen(img)
-    cancel = threading.Event()
-    n = 0
-    for _ in gemma.generate(engine.clone_cache(snap.master), gemma.suffix_ids("Describe this page in detail."),
-                            cancel=cancel, max_tokens=120, max_sentences=99):
-        n += 1
-        if n == 3:
-            cancel.set()
-    assert gemma.last_stop == "cancel"
-    assert n <= 4
 
 
 # -- latency fixes (2026-11-06): early first phrase + Kokoro silence trim

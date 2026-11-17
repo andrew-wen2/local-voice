@@ -26,7 +26,7 @@ Piece limits: an IMPROVING or BACKGROUND piece starts only if its estimated time
 piece in flight at key up is short. CRITICAL and BLOCKING pieces have no limit: the answer needs that work anyway.
 After key up, until the final transcript is in (~40 ms, the answer can't start before it), IMPROVING work for the
 current context still runs under TAIL's limit; a question prefill already under way that the final transcript keeps
-then finishes as CRITICAL before the answer (M3, 2026-11-15).
+then finishes as CRITICAL before the answer.
 
 Backend protocol. Each work method returns a generator that yields the kind of its *next* piece before doing it
 and does no work before its first yield:
@@ -80,7 +80,7 @@ class Estimates:
     for kinds named by size), then the lower median of the prior and the last SAMPLES times. A kind with neither
     raises: a piece that is never allowed to run could otherwise never be measured.
 
-    M3 (2026-11-15): it was an average weighted 0.3 to the newest. One slow piece (a page-in under memory pressure:
+    It used to be an average weighted 0.3 to the newest. One slow piece (a page-in under memory pressure:
     64-300 ms for a ~5 ms retrieval piece) then pushed its kind's estimate over the state's limit; a kind over the
     limit never runs, so it was never measured again, and the job waited for the rest of the turn (every partial's
     retrieval in a whole replay). Now one outlier doesn't move the estimate, and a kind held back by the limit
@@ -263,7 +263,7 @@ class Upgrade(Job):
 
     def runnable(self, s):
         # Frozen in TAIL, where only the question prefill helps near key up -- unless the prefill can't run because
-        # a page has neither an exact cache nor a stored piece; then this page is the only useful work (M3, 2026-11-15).
+        # a page has neither an exact cache nor a stored piece; then this page is the only useful work.
         # The same holds after key up until the final transcript is in (the answer can't start yet).
         return s.state is State.LISTENING or (s._near_up() and bool(s.missing()))
 
@@ -279,7 +279,7 @@ class Upgrade(Job):
 
 
 class Retrieve(Job):
-    """Retrieval for the newest partial transcript, in pieces (M3, 2026-11-15). It ran synchronously in partial()
+    """Retrieval for the newest partial transcript, in pieces. It ran synchronously in partial()
     before: ~90 ms a partial of GPU work outside the pieces, 6-10 partials a question, so page builds idled ~30% of
     the time while you spoke. Partials that arrive while one runs are not retrieved; the newest is, next. Retrieval
     of the final transcript stays synchronous (final()), so what is answered from is unchanged."""
@@ -316,7 +316,7 @@ class Spec(Job):
 
     def cls(self, s):
         # Started and still valid for the final transcript: the answer would redo it from scratch, so it finishes
-        # first (M3, 2026-11-15; before, a prefill cut off at key up was thrown away whole).
+        # first (before, a prefill cut off at key up was thrown away whole).
         return Cls.CRITICAL if s.ctx is not None and s.ctx.final and self.ran else Cls.IMPROVING
 
     def runnable(self, s):
@@ -332,8 +332,8 @@ class Spec(Job):
 
 class AltUpgrade(Job):
     """The next slot of the runner-up context (`ctx.alt`: the next-best kept screen with its memory), computed exactly
-    once the current context and question prefill are done, so a late retrieval switch to it finds it ready (M3,
-    2026-11-13: the question's last words often change which screen is used). Needs a backend with branches."""
+    once the current context and question prefill are done, so a late retrieval switch to it finds it ready (the
+    question's last words often change which screen is used). Needs a backend with branches."""
     order = 3
 
     def __init__(self, s):
@@ -416,7 +416,7 @@ class Scheduler:
         self.ctx = TurnContext(timeline=self.prefix)
         self.turn = {"t_down": self.clock() if t is None else t, "gpu_s": {c.name: 0.0 for c in Cls},
                      "wasted_s": 0.0, "prefix_at_down": self.prefix,
-                     # diagnostics (M3): state changes, GPU time per state:class:kind, pieces the limit held back
+                     # diagnostics: state changes, GPU time per state:class:kind, pieces the limit held back
                      "states": [], "pieces": {}, "blocked": {}}
         self._mark_state()
 
@@ -447,7 +447,7 @@ class Scheduler:
             self._mark_state()
 
     def _diag(self, name: str, *row):
-        """Diagnostics (M3): a timestamped row in this turn's log `name`."""
+        """Diagnostics: a timestamped row in this turn's log `name`."""
         if self.turn is not None:
             self.turn.setdefault(name, []).append((round(self.clock() - self.turn["t_down"], 3), *row))
 
@@ -617,7 +617,7 @@ class Scheduler:
     def _near_up(self) -> bool:
         """TAIL, or key up with the final transcript not in yet (~40 ms; the answer can't start before it). Work for
         the current context runs then in short pieces (TAIL's limit): it is kept if the final transcript keeps the
-        context, dropped as stale if not (M3, 2026-11-15)."""
+        context, dropped as stale if not."""
         return self.state is State.TAIL or (self.state is State.RELEASED and self.ctx is not None
                                             and not self.ctx.final)
 
@@ -782,7 +782,7 @@ class FakeClock:
 class SimBackend:
     """GPU work replaced by fixed piece times on a fake clock. Piece kinds and the counts per job follow the real
     work: a screen read is prep, patch embedding, 16 vision layers, pooling, embeddings and 12 two-layer text
-    pieces (S0); page work and question prefill run in layer pieces."""
+    pieces (measured); page work and question prefill run in layer pieces."""
 
     def __init__(self, clock: FakeClock, times: dict[str, float], built=(), page_pieces: int = 24,
                  question_pieces: int = 6, answer_tokens: int = 10, history: bool = True):

@@ -147,36 +147,6 @@ def test_the_visit_still_on_screen_is_left_out():
     st.close()
 
 
-def test_eval_screen_cache_round_trip(tmp_path):
-    import importlib.util
-
-    import pytest
-    import sys
-    from pathlib import Path
-    root = Path(__file__).resolve().parents[1]
-    if not (root / "eval/real/visual_e2e.py").exists():
-        pytest.skip("needs the local eval scripts (eval/, not on GitHub)")
-    sys.path[:0] = [str(root / "eval/recall"), str(root / "eval/kernels"), str(root / "eval/real")]
-    spec = importlib.util.spec_from_file_location("visual_e2e", root / "eval/real/visual_e2e.py")
-    E = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(E)
-    st = ScreenStore(tmp_path / "live")
-    p = st.save_features(3, np.ones((1, 4, 2), np.float32))
-    q, s = quantize_int8(np.ones((2, 4, 8), np.float32))
-    st.add(Screen(3, 5.0, "k", "T", ["a"], {11: (q, s), 17: (q, s)}, {11: 0.5, 17: -0.2}, p, size=(10, 20), T=99))
-    out = tmp_path / "cache" / "abc"
-    E.save_cache(out, st)
-    assert stat.S_IMODE(os.stat(out).st_mode) == 0o700
-    st2 = ScreenStore(tmp_path / "again")
-    assert E.load_cache(out, st2) and st2.ready(3)
-    s2 = st2.screens[3]
-    assert s2.null == {11: 0.5, 17: -0.2} and s2.T == 99 and s2.size == (10, 20)
-    assert np.array_equal(s2.keys[17][0], q) and np.allclose(st2.load_features(3), 1.0, atol=1 / 127)
-    st.close()
-    st2.close()
-    assert out.exists()                                # the cache outlives the run's temporary store
-
-
 def test_unit_text_joins_its_screen_even_before_it_is_ready():
     st = ScreenStore()
     st.add_lines(2, ["brass lamp"])                       # the screen is still being encoded

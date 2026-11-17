@@ -1,4 +1,4 @@
-"""Turn scheduler (scheduler.py) on a fake clock. Piece times: S0 for screen reads;
+"""Turn scheduler (scheduler.py) on a fake clock. Piece times: measured for screen reads;
 page and question work in layer pieces (estimates, not measured)."""
 import pytest
 
@@ -55,7 +55,7 @@ def test_still_screen_turn_speculation_covers_the_question():
 
 
 def test_no_tail_means_question_prefilled_while_the_final_transcript_comes():
-    """M3 (2026-11-15): with no quiet tail, the question prefill starts at key up, in the ~30 ms before the final
+    """With no quiet tail, the question prefill starts at key up, in the ~30 ms before the final
     transcript, and finishes before the answer once the final transcript keeps it; it isn't redone in the answer.
     Before: all of it after the final transcript, 0.03 + assemble + 6 question pieces."""
     s, _, _ = make()
@@ -258,7 +258,7 @@ def test_a_failing_answer_closes_its_turn_and_the_loop_goes_on():
 
 
 def test_runner_up_context_is_ready_when_retrieval_switches_late():
-    """M3 (2026-11-13): with time to spare during speech, the runner-up's slots are computed exactly too, so a switch
+    """With time to spare during speech, the runner-up's slots are computed exactly too, so a switch
     to them in the last partial finds every slot exact; without the runner-up, the switch starts from nothing."""
     first, runner = ("s1", "op", "v1"), ("s2", "op", "v2")
 
@@ -296,7 +296,7 @@ def test_runner_up_waits_for_the_current_context_and_its_question():
 
 
 def test_retrieval_runs_in_pieces_and_takes_the_newest_partial():
-    """M3 (2026-11-15): retrieval is a job of GPU pieces, not a blocking call in partial(). Partials that arrive while
+    """Retrieval is a job of GPU pieces, not a blocking call in partial(). Partials that arrive while
     one runs aren't retrieved; the newest is, next. The final transcript is still retrieved before the answer."""
     clock = FakeClock()
     be = SimBackend(clock, {**T, "rq": .03}, built=("a", "b", "c"))
@@ -326,7 +326,7 @@ def test_retrieval_runs_in_pieces_and_takes_the_newest_partial():
 
 
 def test_page_build_continues_in_tail_when_the_question_prefill_cannot_run():
-    """M3 (2026-11-15): with no stored pieces for the pages, the question prefill can't run in TAIL; building the
+    """With no stored pieces for the pages, the question prefill can't run in TAIL; building the
     pages then is the only useful work, so it isn't frozen. With stored pieces, TAIL still prefers the prefill."""
     s, be, _ = make(retrieve=lambda text: ("x", "y"), built=(), page_pieces=8)
     be.buildable = lambda page: False           # like a kept screen or its view: no stored piece can be made
@@ -337,7 +337,7 @@ def test_page_build_continues_in_tail_when_the_question_prefill_cannot_run():
 
 
 def test_retrieval_waiting_on_the_disk_lets_page_work_run():
-    """M3 (2026-11-15): while a retrieval's next piece waits for keys to come off the disk, the job isn't runnable
+    """While a retrieval's next piece waits for keys to come off the disk, the job isn't runnable
     (it would otherwise hold the GPU loop: other work runs meanwhile), and it runs once the read is in. (The fake
     clock jumps to the next event when nothing can run, so the read is seen as done only at the next event.)"""
     clock = FakeClock()
@@ -364,7 +364,7 @@ def test_retrieval_waiting_on_the_disk_lets_page_work_run():
 
 
 def test_one_slow_piece_does_not_hold_its_kind_back_for_good():
-    """M3 (2026-11-15): one outlier doesn't move the estimate; repeated slow pieces push it over the limit, and then
+    """One outlier doesn't move the estimate; repeated slow pieces push it over the limit, and then
     the kind is retried after losing BLOCKS_TO_FORGET picks (it can't be re-measured otherwise)."""
     from scheduler import Estimates
     e = Estimates({"rs": 0.005})

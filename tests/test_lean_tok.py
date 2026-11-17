@@ -1,7 +1,6 @@
-"""The app without the Hugging Face tokenizer and processor (lean_tok.py, M3 2026-11-13) gives exactly what they gave:
+"""The app without the Hugging Face tokenizer and processor (lean_tok.py) gives exactly what they gave:
 token ids and decoded text, the rendered prompts, and a screen's model inputs. Needs the model files (and builds
 lean_tokenizer.npz / lean_chat.json if missing); loads weights lazily, nothing runs on the GPU."""
-import glob
 import json
 import random
 from pathlib import Path
@@ -38,10 +37,6 @@ def pair():
 
 def corpus():
     texts = []
-    for f in glob.glob(str(ROOT / "eval/recall/sessions/*/session.json")):
-        s = json.loads(Path(f).read_text())
-        texts += [p.get("text", "") for p in s["pages"]] + [p.get("title", "") for p in s["pages"]]
-        texts += [q.get("question", "") for q in s.get("probes", [])]
     texts += (ROOT / "README.md").read_text().split("\n\n") + (ROOT / "engine.py").read_text().split("\n\n")[:400]
     texts += ["a  b   c", "  lead", "trail  ", "\n\n\n", "x > </y>", "<div> </div>", "emoji 🍩🤖", "日本語", "naïve",
               "​", "<0x41>", "a\r\nb", "\x00\x07", "▁x▁", "$3,488/mo", "<|turn>user\nhi<turn|>"]
@@ -74,14 +69,25 @@ def test_prompts_are_identical(pair):
     assert lean.screen_turn_prompt("Open windows: Chrome") == old.screen_turn_prompt("Open windows: Chrome")
 
 
+def screens():
+    """Two generated screens (text on white, a dark sidebar) at the app's capture size, plus resized copies."""
+    from PIL import ImageDraw
+    imgs = []
+    for seed in (0, 1):
+        rnd = random.Random(seed)
+        img = Image.new("RGB", (1512, 982), "white")
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, 220, 982), fill=(40, 44, 52))
+        for y in range(40, 940, 28):
+            d.text((260, y), " ".join(rnd.choice(["rent", "$3,488", "kettle", "Tuesday", "8:15", "naïve"])
+                                      for _ in range(rnd.randint(3, 12))), fill="black")
+        imgs.append(img)
+    return imgs + [imgs[0].resize((1440, 900)), imgs[0].resize((2560, 1600))]
+
+
 def test_screen_inputs_are_identical(pair):
     lean, old = pair
-    pngs = sorted(glob.glob(str(ROOT / "eval/recall/sessions/h1/png/*.png")))[:2]
-    if not pngs:
-        pytest.skip("benchmark screens not made")
-    imgs = [Image.open(p).convert("RGB") for p in pngs]
-    imgs += [imgs[0].resize((1512, 982)), imgs[0].resize((2560, 1600))]
-    for img in imgs:
+    for img in screens():
         for prompt in (lean.screen_turn_prompt(), "<|turn>user\n(Earlier screen) 9:41 AM\n<|image|><turn|>\n"):
             a, b = lean._inputs(img, prompt), old._inputs(img, prompt)
             assert sorted(a) == sorted(b)

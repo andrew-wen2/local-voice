@@ -1,7 +1,7 @@
-"""lean_tok.py — Gemma's tokenizer without `tokenizers` / `transformers` in the app process (M3, 2026-11-13).
+"""lean_tok.py — Gemma's tokenizer without `tokenizers` / `transformers` in the app process.
 
 The Hugging Face tokenizer for Gemma 4 (BPE, 262,144 pieces, 514,906 merges, byte fallback) held ~0.30 GB in the
-app; deleting it freed only about half. Andrew's memory target (app + helpers ≤ 4.0 GB) asked for it to go. This is the
+app; deleting it freed only about half. The memory target (app + helpers ≤ 4.0 GB) asked for it to go. This is the
 same algorithm on compact arrays (~20 MB): ids identical to the Hugging Face tokenizer, checked on every text the app
 sees in the benchmark plus synthetic edge cases (tests/test_lean_tok.py).
 

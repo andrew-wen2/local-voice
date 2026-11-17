@@ -24,7 +24,7 @@ import snowballstemmer
 SECTION_TOKENS = 400     # best section per page: about two screens of OCR text (160-180 tokens a screen)
 
 # General English function words. Kept generic on purpose: the check must not be tuned to the benchmark's
-# phrasing (see eval/recall/retrieval.py for the dev / held-out split).
+# phrasing.
 STOP = set("""
 a an the and or but if then so of to in on at by for with from about into over under after before up down
 out off as is are was were be been being am do does did done have has had having it its this that these those

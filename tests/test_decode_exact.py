@@ -1,4 +1,4 @@
-"""Pipelined decoding (M3, 2026-11-15) gives the same tokens as the loop it replaced: the next token's forward pass is
+"""Pipelined decoding gives the same tokens as the loop it replaced: the next token's forward pass is
 queued before this token's CPU work, nothing else changes. Needs the model files (decodes a few short answers)."""
 from pathlib import Path
 

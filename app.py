@@ -6,9 +6,9 @@
                                      Enter in the terminal also works (talk / stop / interrupt), q = quit
   python app.py --screen-only        the previous app: the current screen only, no memory of past screens
 
-Review decisions implemented here: readiness gate (D8), Screen Recording check + near-silent
-flag (D5), interrupt stops the work (D6), per-turn logs with combined memory (D19), screen age
-from capture time (D16), contention cases (D17), offline env (D3/D14), private logs (D4).
+Also here: a readiness gate, Screen Recording check + near-silent
+flag, interrupt stops the work, per-turn logs with combined memory, screen age
+from capture time, contention cases, offline env, private logs.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def footprint_bytes(pid: int) -> Optional[int]:
 
 
 class Monitor(threading.Thread):
-    """Once a second: combined memory of this app + the speech recognition process (D19), and macmon power/fan if available."""
+    """Once a second: combined memory of this app + the speech recognition process, and macmon power/fan if available."""
 
     def __init__(self, pids_fn):
         super().__init__(daemon=True, name="monitor")
@@ -146,7 +146,7 @@ class Assistant:
         self.ready = False
 
     def start(self, warm_image, first_frame=None):
-        """Readiness gate (D8): ASR healthy + warm, models loaded + warm, first screen read done."""
+        """Readiness gate: ASR healthy + warm, models loaded + warm, first screen read done."""
         t_all = time.perf_counter()
         self.monitor.start()
         self.startup["asr_start_s"] = round(self.asr.start(sandbox_profile=self.sandbox_profile), 2)
@@ -211,7 +211,7 @@ class Assistant:
         row["wait_behind_read_ms"] = round(r.get("wait_behind_read_s", 0) * 1000, 1)
         row["restore_ms"] = round(r.get("restore_s", 0) * 1000, 2)
         if r.get("screen_captured_at"):
-            row["screen_age_s"] = round(t_eos_wall - r["screen_captured_at"], 3)        # from capture (D16)
+            row["screen_age_s"] = round(t_eos_wall - r["screen_captured_at"], 3)        # from capture
             row["screen_read_done_before_eos_s"] = round(t_eos_wall - r["screen_read_done"], 3)
         return row
 

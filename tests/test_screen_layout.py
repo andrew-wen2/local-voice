@@ -1,4 +1,4 @@
-"""A kept screen's token layout without running the processor per screen (M3, 2026-11-13): the image's token block is
+"""A kept screen's token layout without running the processor per screen: the image's token block is
 cached per size, the text tokenized on its own; it must equal the processor's output exactly. Needs the model files
 (the processor only; weights load lazily, nothing runs on the GPU)."""
 from pathlib import Path

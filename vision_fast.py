@@ -7,7 +7,7 @@
    no padding, so mlx-vlm's dense [1, 1, P, P] mask is all zeros (184 MB at 1120) and only slows the
    fused attention kernel (~12 ms per layer). Dropping it is bit-identical.
 3. Optionally, each encoder layer under mx.compile, which fuses the element-wise ops around the
-   matmuls (norms, RoPE, clips, GELU). Not bit-identical; checked separately (eval/exactness.py).
+   matmuls (norms, RoPE, clips, GELU). Not bit-identical; checked separately against an fp32 run.
 4. Optionally, attention's q/k/v norm + 2D RoPE + layout as one custom Metal kernel
    (kernels/vision_qkv.py), with the RoPE table computed once per image. Not bit-identical either.
 
@@ -84,7 +84,7 @@ def layer_fn(layer, compiled: bool, kernel: bool = False):
 
 def install():
     """Wrap mlx-vlm's Gemma 4 vision classes once. The fast paths apply only to models passed to enable(),
-    so a model loaded without it (eval/exactness.py's "slowvision") runs mlx-vlm's code unchanged."""
+    so a model loaded without it (for comparison) runs mlx-vlm's code unchanged."""
     global _installed
     if _installed:
         return

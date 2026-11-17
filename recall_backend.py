@@ -16,7 +16,7 @@ Stored page pieces (graph): a page is computed after the stored pieces of its K_
 first seen before it (the retriever's BM25, the page's title and text as the query), loaded and re-rotated, after
 the anchor <bos> <|turn>user\\n pages header. The piece (full-attention entries, 16 KB a token, and its last W window
 entries, needed only when it is a parent in a later build) goes to a private folder on disk, deleted when the app
-quits; memory holds only its token ids and parents, so memory doesn't grow with the hour (Andrew, 2026-11-13). A
+quits; memory holds only its token ids and parents, so memory doesn't grow with the hour. A
 question loads the pieces its context uses, bounded by the context cap. A page's piece is rebuilt when its version changes (a visit of it ended: its text and time
 header changed).
 
@@ -71,14 +71,14 @@ NULL_Q = "N/A"                    # ICR's content-free query
 K_PARENTS = 4                 # a page is computed after its 4 most similar pages
 CHUNK = 512                   # tokens per prefill chunk
 TOKENS_PER_S = 2200           # prefill rate, plugged in; first estimate only, then measured per kind
-PIECE_OVERHEAD_S = 0.003      # S0: pausing costs ~3 ms a piece
+PIECE_OVERHEAD_S = 0.003      # pausing costs ~3 ms a piece
 HEAD = (PAGES_HEAD + HINT).rstrip("\n")
 VISION_KINDS = ["prep", "patch"] + ["vision"] * 16 + ["pool"]
-PRIORS = {                    # seconds; S0 for the read, estimates for the rest
+PRIORS = {                    # seconds; measured for the read, estimates for the rest
     "prep": 0.061, "patch": 0.088, "vision": 0.080, "pool": 0.010, "embed": 0.008, "text": 0.042,
     "check": 0.0005, "plan_build": 0.010, "assemble": 0.015, "answer_prefill": 0.060, "decode": 0.026,
     "text1": 0.021, "screen_prep": 0.004, "append": 0.030,     # features from disk + the cached token layout (2-3 ms measured, 2026-11-13)
-    "rq": 0.006, "rs": 0.005, "rprep": 0.002, "rlay": 0.003,  # retrieval pieces: 3 layers, 32 screens (M3, 2026-11-15)
+    "rq": 0.006, "rs": 0.005, "rprep": 0.002, "rlay": 0.003,  # retrieval pieces: 3 layers, 32 screens
 }
 
 
@@ -165,7 +165,7 @@ class TurnIO:
 class RecallBackend:
     def __init__(self, adapter, store, tts=None, trim_silence: bool = True,
                  history_max_tokens: int = 2000, k_parents: int = K_PARENTS, piece_dir: Optional[Path] = None,
-                 screen_store=None, n_screens: int = 1):           # Andrew, 2026-11-11
+                 screen_store=None, n_screens: int = 1):
         self.a, self.store, self.tts = adapter, store, tts
         self.ss, self.n_screens = screen_store, n_screens
         from concurrent.futures import ThreadPoolExecutor
@@ -189,13 +189,13 @@ class RecallBackend:
         self.prefix_n = 0                               # exchanges in the prefix
         self.hist_end = None                            # (offset, window snapshot) before the pages turn opens
         # Exact caches (prefix + slots computed in order), built by upgrade(): the current context's and, while the GPU
-        # would otherwise idle during speech, the runner-up's (M3, 2026-11-13), so a late switch finds it ready. Each:
+        # would otherwise idle during speech, the runner-up's, so a late switch finds it ready. Each:
         # {"cache", "slots", "bounds": [(offset, window snapshot) where each slot starts], "busy"}; most recent first,
         # at most MAX_BRANCHES, all on prefix version branch_v.
         self.branches: list[dict] = []
         self.branch_v = -1
-        # The assembled context for the current key, with the question so far prefilled into it in place (M3,
-        # 2026-11-13: no second copy for the question): {"key", "cache", "end": (offset, window snapshot) where the
+        # The assembled context for the current key, with the question so far prefilled into it in place (no
+        # second copy for the question): {"key", "cache", "end": (offset, window snapshot) where the
         # context ends, "ids", "cov": question tokens in the cache, "dirty": a prefill was cut short}.
         self.base: Optional[dict] = None
         self.io: Optional[TurnIO] = None
@@ -368,7 +368,7 @@ class RecallBackend:
             self.read_feats[fid] = enc[1]               # a kept frame that was read is keyed from these, not re-encoded
             for f in sorted(self.read_feats)[:-READ_FEATS]:
                 del self.read_feats[f]
-            # one text layer a piece: half the temporary memory of two (the read's peak, M3 2026-11-13)
+            # one text layer a piece: half the temporary memory of two (the read's peak)
             c, _ = yield from steps(self.a.screen_steps(self.screen_anchor, enc, layers_per_piece=1),
                                     ["embed"] + ["text1"] * self.lay.n)
             self.screens[fid] = K.take(self.lay, c, self.screen_pos, window=True)
@@ -435,7 +435,7 @@ class RecallBackend:
         (features come from storage). The image's token block depends only on the size (and the budget), so the
         processor runs once per size, on a blank image; the text around it is tokenized on its own, which gives the
         processor's exact ids because "<|image|>" is a special token (nothing merges across it). Running the processor
-        per screen took ~65-77 ms, over the 50 ms piece limit while you speak (M3, 2026-11-13)."""
+        per screen took ~65-77 ms, over the 50 ms piece limit while you speak."""
         key = (tuple(size), getattr(self.a, "budget", None))
         if key not in self._tpl:
             from PIL import Image
@@ -477,7 +477,7 @@ class RecallBackend:
         inp = self._inputs_like(s.size, self._turn_text(s))
         feats = mx.array(self.ss.load_features(fid))
         # One text layer a piece (~22 ms): two-layer pieces took ~42-45 ms, so close to the 50 ms limit while you speak
-        # that their estimate drifted over it and they stopped running during speech (M3, 2026-11-13).
+        # that their estimate drifted over it and they stopped running during speech.
         out, _ = yield from steps(self.a.screen_steps(c, (inp, feats), layers_per_piece=1),
                                   ["embed"] + ["text1"] * self.lay.n)
         return out
@@ -489,7 +489,7 @@ class RecallBackend:
         """The question's queries at KEY_LAYERS (post-RoPE, as attention sees them), re-rotated to sit right after a
         screen turn of T tokens, as when the keys were measured. {layer: (queries [heads, Lq, D] float16, scale)}.
         Generator in pieces of QUERY_LAYERS text layers ("rq"). Only the layers up to the last key layer run: the
-        queries there don't depend on later layers (M3, 2026-11-15: 18 of 24 layers, same values). The capture is
+        queries there don't depend on later layers (18 of 24 layers, same values). The capture is
         on only during this pass's own pieces, so pieces of other jobs in between aren't captured."""
         ids = [self.a.tok.bos_token_id] + list(self._ids(" " + text))
         top = max(KEY_LAYERS) + 1
@@ -514,7 +514,7 @@ class RecallBackend:
     def _score(q, scale, k8, ks) -> mx.array:
         """Mean over question tokens and query heads of the max over image tokens of q.k * scale, for a batch of
         frames' int8 keys [n, kv heads, n_img, D] with scales [n, kv heads, n_img, 1].
-        M3 (2026-11-15), same values bit for bit as the einsum it replaced, ~3-4x faster: one batched matmul per kv
+        Same values bit for bit as the einsum it replaced, ~3-4x faster: one batched matmul per kv
         head group, the int8 -> float16 step compiled (fixed shape per batch, so compiled once), and the max over
         image tokens taken before the float32 cast and the scale (both monotone for scale > 0, so the max is the
         same element)."""
@@ -719,7 +719,7 @@ class RecallBackend:
         return own
 
     def end_turn(self):
-        """The turn closed: its exact branches and assembled context go (M3, 2026-11-13). After an answer the prefix
+        """The turn closed: its exact branches and assembled context go. After an answer the prefix
         changes anyway (the exchange is appended); keeping them made idle memory step up by ~0.25 GB after the
         first question and raised the peak of reads between turns."""
         self.branches.clear()
@@ -775,7 +775,7 @@ class RecallBackend:
         assert compute_missing or last < 0, rest[last]
         for slot in rest[:last + 1]:
             c = yield from self._slot_into(c, slot)
-        yield "append"          # its own piece: the copy and this were 54-75 ms together, over the 50 ms limit (M3)
+        yield "append"          # its own piece: the copy and this were 54-75 ms together, over the 50 ms limit
         return K.append(self.lay, c, [self.piece(sl) for sl in rest[last + 1:]] + [self.screens[fid]], copy=False)
 
     def spec(self, key, ids, have):
@@ -819,7 +819,7 @@ class RecallBackend:
     def _rewind(self, s, ids, limit: int):
         """Cut a question prefill back to the longest prefix of `ids` (at most `limit` tokens) that a clean prefill
         holds: the context's end, or one of the last SPEC_SNAPS prefill ends (window layers can only be restored from
-        a snapshot). M3, 2026-11-15: a changed last word (or a prefill cut off at key up) used to throw the whole
+        a snapshot). Before this, a changed last word (or a prefill cut off at key up) used to throw the whole
         question prefill away; in 16 of 54 turns the answer then prefilled all ~15-20 question tokens itself."""
         held = s["ids"][:s["cov"]]
         n = 0
@@ -870,7 +870,7 @@ class RecallBackend:
 
     def _speak(self, cache, ids, io: TurnIO, on_first_token):
         """Decode, one token a piece, handing phrases and sentences to TTS as they complete (GpuWorker._answer's
-        rules: an early first phrase, then whole sentences). TTS runs on its own thread (M3, 2026-11-13): Kokoro
+        rules: an early first phrase, then whole sentences). TTS runs on its own thread: Kokoro
         synthesizes on the Neural Engine while decoding goes on, instead of decoding waiting for each chunk."""
         r = io.result
         text, buf, chunks = "", "", 0
@@ -887,7 +887,7 @@ class RecallBackend:
                     continue                            # drain: nothing more is spoken
                 t0 = time.perf_counter()
                 # The answer's first chunk starts at its first sample above -50 dB (the audible threshold): the 30 ms
-                # pad kept before later chunks spaces them; before the first it only delays the answer (M3, 2026-11-15).
+                # pad kept before later chunks spaces them; before the first it only delays the answer.
                 said = False
                 for audio in self.tts.synth(sentence, cancel=io.cancel, trim=self.trim,
                                             tail_keep_ms=40 if mid_sentence else 120, lead_keep_ms=0 if first else 30):
