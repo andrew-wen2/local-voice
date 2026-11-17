@@ -185,6 +185,8 @@ class Build(Job):
 
     def cls(self, s):
         c = s.ctx
+        if getattr(s.backend, "background_only", lambda p: False)(self.page):
+            return Cls.BACKGROUND
         return Cls.IMPROVING if c is not None and self.page in c.pages[c.frontier:] else Cls.BACKGROUND
 
 
@@ -237,6 +239,8 @@ def _label(pages) -> Optional[str]:
     for p in pages:
         if p and str(p[0]).endswith("screen"):
             out.append(f"s{p[1]}")
+        elif p and str(p[0]).endswith("block"):
+            out.append(f"b{p[1]}")
         elif len(p) == 1:
             out.append(str(p[0])[:6])
         else:
@@ -617,10 +621,18 @@ class Scheduler:
         return self.state is State.TAIL or (self.state is State.RELEASED and self.ctx is not None
                                             and not self.ctx.final)
 
+    def _exact_wanted(self, slot) -> bool:
+        return getattr(self.backend, "exact_wanted", lambda p: True)(slot)
+
+    def _settled(self) -> bool:
+        """Nothing left to compute for the context: every slot exact, or past the frontier with a stored piece that
+        the backend uses as it is (a kept screen's stored block)."""
+        c = self.ctx
+        return all(not self._exact_wanted(p) and self.backend.has_piece(p) for p in c.pages[c.frontier:])
+
     def _spec_phase(self) -> bool:
         c = self.ctx
-        return c is not None and (self._near_up() or
-                                  (self.state is State.LISTENING and c.frontier == len(c.pages)))
+        return c is not None and (self._near_up() or (self.state is State.LISTENING and self._settled()))
 
     def _question_reusable(self, key, ids) -> int:
         """How many of `ids` a finished question prefill already covers for this context."""
@@ -642,14 +654,17 @@ class Scheduler:
         if c.want is not None and not c.final and not any(isinstance(j, Retrieve) for j in self.jobs):
             text, c.want = c.want, None
             self._add(Retrieve(self, text))
-        if (c.frontier < len(c.pages) and (self.state is State.LISTENING or self.missing())
+        if (c.frontier < len(c.pages) and self._exact_wanted(c.pages[c.frontier])
+                and (self.state is State.LISTENING or self.missing())
                 and not any(isinstance(j, Upgrade) for j in self.jobs)):
             self._add(Upgrade(self))
         if (c.words and self._spec_phase() and not self.missing() and c.spec != (self.key(), c.words)
                 and not any(isinstance(j, Spec) for j in self.jobs)):
             self._add(Spec(self))
-        if (self.state is State.LISTENING and c.alt and c.frontier == len(c.pages)
-                and self.backend.exact_len(c.alt) < len(c.alt) and not any(isinstance(j, AltUpgrade) for j in self.jobs)):
+        if (self.state is State.LISTENING and c.alt and self._settled()
+                and self.backend.exact_len(c.alt) < len(c.alt)
+                and self._exact_wanted(c.alt[self.backend.exact_len(c.alt)])
+                and not any(isinstance(j, AltUpgrade) for j in self.jobs)):
             self._add(AltUpgrade(self))
 
     def _pick(self) -> Optional[Job]:
@@ -714,6 +729,8 @@ class Scheduler:
         self.stats["pieces"] += 1
         self.log.append((t0, dt, state, cls, kind, est))
         if self.turn is not None:
+            if kind in ("answer_prefill", "decode") and len(self.turn.setdefault("decode_log", [])) < 12:
+                self.turn["decode_log"].append((round(t0, 4), round(dt, 4)))    # diagnostics: per answer piece
             self.turn["gpu_s"][cls.name] += dt
             k = f"{state.name}:{cls.name}:{kind}"
             self.turn["pieces"][k] = round(self.turn["pieces"].get(k, 0.0) + dt, 4)

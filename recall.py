@@ -188,8 +188,9 @@ def clock_times(question: str, start: datetime, end_s: float) -> list[float]:
             continue
         cands = []
         for h24 in ({(hh % 12) + (12 if ap.lower().startswith("p") else 0)} if ap else {hh % 12, hh % 12 + 12}):
-            t = (start.replace(hour=h24, minute=mm, second=0, microsecond=0) - start).total_seconds()
-            cands.append((0 if 0 <= t <= end_s else min(abs(t), abs(t - end_s)), t))
+            t0 = (start.replace(hour=h24, minute=mm, second=0, microsecond=0) - start).total_seconds()
+            for t in (t0 - 86400, t0, t0 + 86400):     # the day before or after too: an hour can cross midnight
+                cands.append((0 if 0 <= t <= end_s else min(abs(t), abs(t - end_s)), t))
         out.append(min(cands)[1])
     return out
 

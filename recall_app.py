@@ -42,7 +42,8 @@ class RecallApp:
                  sleep: Callable[[float], None] = time.sleep, budget: int = 1120, swap_weights: bool = True,
                  freshness: str = "B", first_chunk: str = "phrase", trim_silence: bool = True,
                  mlx_cache_gb: Optional[float] = 0.0, use_ane: bool = False, log_path: Optional[Path] = None,
-                 show_text: bool = False, on_row: Optional[Callable[[dict], None]] = None, monitor: bool = True):
+                 show_text: bool = False, on_row: Optional[Callable[[dict], None]] = None, monitor: bool = True,
+                 on_ui: Optional[Callable[[dict], None]] = None):
         self.grab_screen, self.grab_small, self.windows_fn = grab, grab_small, windows_fn
         self.clock, self.sleep = clock, sleep
         self.speaker, self.mic = speaker, mic
@@ -50,6 +51,7 @@ class RecallApp:
         self.first_chunk, self.trim_silence, self.mlx_cache_gb = first_chunk, trim_silence, mlx_cache_gb
         self.use_ane, self.log_path, self.show_text, self.on_row = use_ane, log_path, show_text, on_row
         self.want_monitor = monitor
+        self.on_ui = on_ui                               # caption events for the menu bar panel (menubar.py)
         self.asr = self.tts = self.store = self.screens = self.worker = None
         self.ane = self.encoder = self.ocr = self.watcher = self.monitor = None
         self.before: dict = {}
@@ -57,6 +59,19 @@ class RecallApp:
         self.seq = 0
         self.rows: deque = deque(maxlen=100)            # the latest turns (all of them are in the log file)
         self.startup: dict = {}
+
+    def _ui(self, ev: str, **kw):
+        if self.on_ui is not None:
+            try:
+                self.on_ui({"ev": ev, **kw})
+            except Exception:
+                pass                                     # captions never break a turn
+
+    def data_dirs(self) -> list[str]:
+        """Folders holding what it saw (kept screens, stored pieces); deleted on stop, listed so a hard kill can't leave
+        them behind (menubar.py deletes them after the process ends)."""
+        dirs = [getattr(self.screens, "dir", None), getattr(getattr(self.worker, "backend", None), "dir", None)]
+        return [str(d) for d in dirs if d is not None]
 
     # ------------------------------------------------------------ start / stop
 
@@ -79,6 +94,7 @@ class RecallApp:
         self.worker.ready.wait()
         if self.worker.error:
             raise self.worker.error
+        self._ui("dirs", paths=self.data_dirs())        # before anything is kept, so a kill during loading can't leak them
         if self.use_ane:            # off (Andrew, 2026-11-13): the Neural Engine copy held ~0.74 GB; kept screens use the GPU
             try:
                 from ane_vision import OUT, AneProcess
@@ -170,7 +186,13 @@ class RecallApp:
         self.seq += 1
         self.turn.update(source=source, t_press=time.perf_counter(), stop=threading.Event(), seq=self.seq,
                          state="recording")
-        self.turn["partials"] = Partials(self.asr, self.mic.audio, self.mic.voiced_until, self.worker.partial)
+        self._ui("listening")
+        on_partial = self.worker.partial
+        if self.on_ui is not None:
+            def on_partial(text, _p=self.worker.partial):
+                _p(text)
+                self._ui("heard", text=text)
+        self.turn["partials"] = Partials(self.asr, self.mic.audio, self.mic.voiced_until, on_partial)
         self.turn["partials"].start()
         threading.Thread(target=self._watch_voice, args=(self.turn["stop"],), daemon=True).start()
 
@@ -196,6 +218,7 @@ class RecallApp:
         self.worker.cancel_turn()
         self.worker.turn_active = False
         self.turn["state"] = "idle"
+        self._ui("idle")
 
     def release(self, extra: Optional[dict] = None) -> threading.Thread:
         """Talk key up: finish the transcript, answer, play it, log the turn. Returns the turn's thread."""
@@ -217,9 +240,11 @@ class RecallApp:
                     first_audio["t"] = time.perf_counter() + i / sr
             self.speaker.play(samples, sr)
 
-        io = TurnIO(emit_audio=emit, mark=mark)
+        io = TurnIO(emit_audio=emit, mark=mark,
+                    on_say=(lambda text: self._ui("say", text=text)) if self.on_ui is not None else None)
         turn["io"] = io
         my = turn["seq"]
+        self._ui("thinking")
         self.worker.key_up(io)
 
         def run():
@@ -242,6 +267,7 @@ class RecallApp:
             else:
                 io.question = text
                 self.worker.final(text)
+                self._ui("heard", text=text, final=True)
             io.done.wait(120)
             row.update(io.result)
             self.speaker.wait_done(60)
@@ -269,6 +295,7 @@ class RecallApp:
                 self.on_row(row)
             if self.seq == my:
                 turn["state"] = "idle"
+                self._ui("done", error=row.get("error"))
 
         turn["state"] = "answering"
         turn["thread"] = threading.Thread(target=run, daemon=True)

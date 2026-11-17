@@ -41,3 +41,22 @@ def test_drop_in_modules_match_the_originals():
     assert mx.array_equal(ie(ids), qe(ids)).item()
     h = mx.random.normal((1, 512)).astype(mx.float32)
     assert mx.array_equal(ie.as_linear(h), qe.as_linear(h)).item()
+
+
+def test_two_rows_are_each_bit_identical_to_one_row():
+    """M3 (2026-11-15), kernel lever 1: 2 rows of x share each weight block load (18 vs 25 ms over all 342 matmuls,
+    cold weights); every output row must equal the one-token kernel on that row alone, bit for bit."""
+    import mlx.core as mx
+    import numpy as np
+    import kernels.indexed_qmv as Q
+    rng = np.random.default_rng(3)
+    for N, K in ((2560, 10240), (10240, 2560), (2048, 2560)):
+        w = mx.array(rng.integers(0, 2**32, (N, K // 8), dtype=np.uint32))
+        # real tensors use 928-5,179 distinct (scale, bias) pairs: draw from a small set, as they do
+        scales = mx.array(rng.choice(rng.random(40) * 0.01, (N, K // 64)).astype(np.float32)).astype(mx.bfloat16)
+        biases = mx.array(rng.choice(rng.random(40) * 0.01 - 0.005, (N, K // 64)).astype(np.float32)).astype(mx.bfloat16)
+        idx, table = Q.build_index(scales, biases)
+        x = mx.array(rng.standard_normal((2, K)).astype(np.float32)).astype(mx.bfloat16)
+        y = Q.indexed_matmul(x, w, idx, table)
+        rows = mx.concatenate([Q.indexed_qmv(x[i:i + 1], w, idx, table) for i in range(2)])
+        assert mx.array_equal(y, rows).item(), (N, K)

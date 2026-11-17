@@ -8,7 +8,7 @@ import mlx.nn as nn
 import pytest
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 
-from kv_reuse import Piece, append, take
+from kv_reuse import append, take
 
 W, D, H = 8, 16, 2
 

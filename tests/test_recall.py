@@ -275,3 +275,13 @@ def test_dropped_frames_give_their_text_to_the_kept_screen():
         time.sleep(0.02)
     o.stop()
     assert kept == [1] and more == [(1, ["alpha"])]
+
+
+def test_clock_times_across_midnight():
+    """A session that starts before midnight: "12:04" is 12:04 AM the next day, 6 minutes in (it was ~24 h off)."""
+    from datetime import datetime
+    from recall import clock_times
+    start = datetime(2026, 11, 15, 23, 58)
+    assert clock_times("what was I doing around 12:04?", start, 3600) == [360.0]
+    assert clock_times("what was on screen at 12:04 am?", start, 3600) == [360.0]
+    assert clock_times("what was on screen at 11:59 pm?", start, 3600) == [60.0]

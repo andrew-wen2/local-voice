@@ -29,6 +29,12 @@ from typing import Callable, Iterator, Optional
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# M3 (2026-11-16): bigger Metal command buffers. MLX spends ~16 ms of CPU encoding a forward pass's ~2,500 kernels
+# and sends them to the GPU in batches; with these, 5 alternating processes each: the answer's first token 45 -> 35
+# ms, the 7th 213 -> 208 ms, same tokens (only how work is batched to the GPU changes). Read when MLX first makes
+# its GPU device, so set before MLX is used.
+os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "400")
+os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "200")
 
 # M3: keep torch out of the app process. transformers (Gemma's processor) and spaCy's thinc (Kokoro's
 # phonemizer) both treat it as optional; a None entry makes `import torch` fail and find_spec return

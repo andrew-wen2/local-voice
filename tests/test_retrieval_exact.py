@@ -89,3 +89,39 @@ def test_scores_are_identical(be):
             q, scale = qv[L]
             a, b = einsum_score(q, scale, k8, ks), RB.RecallBackend._score(q, scale, k8, ks)
             assert np.array_equal(np.asarray(a), np.asarray(b)), (n, L)
+
+
+def test_rewound_question_prefill_is_exact(be):
+    """M3 (2026-11-15): a question prefill whose last words changed is cut back to its longest still-valid prefix
+    (window layers restored from a snapshot) and continued; the cache must equal one that never took the wrong turn,
+    built with the same prefill steps."""
+    import recall_backend as RB
+    from recall_backend import window_snapshot
+    a = be.a
+    be.base = None
+    ctx = [a.tok.bos_token_id] + a.text_ids("<|turn>user\n" + "notes about the page. " * 150)
+    A = a.text_ids(" what was the rent for 974 Halsey Corps apartment")
+    B = a.text_ids(" what was the rent for 974 Halsey Court, App 3B?")
+    k = next(i for i in range(min(len(A), len(B))) if A[i] != B[i])
+    c = RB.RecallBackend._run(be._prefill(a.model.make_cache(), ctx))
+    s = {"cache": c, "end": (int(c[0].offset), window_snapshot(be.lay, c)), "ids": (), "cov": 0, "dirty": False,
+         "snaps": []}
+    for upto in (k - 2, len(A) - 1):                  # two partials' prefills, the second past the changed word
+        RB.RecallBackend._run(be._prefill(c, A[s["cov"]:upto], layers=4))
+        s["snaps"] = (s["snaps"] + [(upto, (int(c[0].offset), window_snapshot(be.lay, c)))])[-RB.SPEC_SNAPS:]
+        s.update(ids=tuple(A), cov=upto)
+    be._rewind(s, B, len(B) - 1)
+    assert s["cov"] == k - 2 and int(c[0].offset) == len(ctx) + k - 2
+    RB.RecallBackend._run(be._prefill(c, B[k - 2:len(B) - 1], layers=4))
+    ref = RB.RecallBackend._run(be._prefill(a.model.make_cache(), ctx))
+    RB.RecallBackend._run(be._prefill(ref, A[:k - 2], layers=4))
+    RB.RecallBackend._run(be._prefill(ref, B[k - 2:len(B) - 1], layers=4))
+    for x, y in zip(c, ref):
+        assert int(x.offset) == int(y.offset)
+        kx, vx = x.state
+        ky, vy = y.state
+        n = min(kx.shape[2], ky.shape[2]) if x.offset > kx.shape[2] else int(x.offset)
+        assert mx.array_equal(kx[:, :, :n], ky[:, :, :n]).item() and mx.array_equal(vx[:, :, :n], vy[:, :, :n]).item()
+    la = a.lm(inputs=mx.array([[B[-1]]]), cache=c).logits
+    lb = a.lm(inputs=mx.array([[B[-1]]]), cache=ref).logits
+    assert mx.array_equal(la, lb).item()

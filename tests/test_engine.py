@@ -232,7 +232,6 @@ def test_p2_freshness_a_answers_stale_when_the_read_is_far_from_done(monkeypatch
     w.submit_frame(2, time.time(), "img")
     time.sleep(0.1)                              # ~37 pieces left: ~1.1 s > 300 ms
     job, _, _ = _job()
-    t_submit = time.perf_counter()
     w.submit_answer(job)
     assert job.done.wait(5)
     assert job.result["fresh_decision"] == "answer" and job.result["frame_id"] == 1

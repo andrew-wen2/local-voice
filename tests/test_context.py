@@ -181,6 +181,5 @@ def test_answers_never_wait_for_more_than_their_own_conversation(make):
     w = make(piece_s=0.03, freshness="C")
     show(w, 1, "A")
     w.submit_frame(2, time.time(), "B")               # a long read is under way
-    t0 = time.perf_counter()
     r = ask(w, "q1")
     assert r["wait_behind_read_s"] < 0.1              # C and no earlier turns: answer at once

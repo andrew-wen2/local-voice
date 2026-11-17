@@ -17,7 +17,7 @@ from typing import Callable, Optional
 import mlx.core as mx
 
 from recall import HINT, PAGES_HEAD
-from recall_backend import KEY, OPENER, SCREEN, RecallBackend, TurnIO
+from recall_backend import BLOCK, KEY, OPENER, SCREEN, RecallBackend, TurnIO
 from scheduler import Scheduler
 
 CAP = 4000          # memory slot cap, tokens (timeline + pages), as the M1 runs (§3.11)
@@ -29,6 +29,7 @@ class RecallWorker(threading.Thread):
                  history_max_tokens: int = 2000, backend_factory: Optional[Callable] = None, screen_store=None):
         super().__init__(daemon=True, name="recall-gpu")
         self.adapter, self.tts, self.store, self.budget, self.cap = adapter, tts, store, budget, cap
+        self._slots: dict = {}                          # (view, version, room) -> a kept screen's block slot
         self.freshness, self.first_chunk, self.trim, self.mlx_cache_gb = freshness, first_chunk, trim_silence, mlx_cache_gb
         self.history_max_tokens = history_max_tokens
         self.backend_factory = backend_factory
@@ -186,8 +187,7 @@ class RecallWorker(threading.Thread):
             self._found = {}
             s.key_down(t=args[0])
         elif name == "key_frame":
-            s.add_build((KEY, args[0]))
-            s.add_build((f"view:{args[0]}", 0, 0))      # its view's stored piece, once keying has registered it
+            s.add_build((KEY, args[0]))     # its block is queued once keyed (_queue_blocks); no separate view piece
         elif name == "key_up":
             self.io = self.backend.io = args[1]
             s.key_up(t=args[0])
@@ -197,6 +197,7 @@ class RecallWorker(threading.Thread):
                 p = self.store.m.pages.get(key)
                 if p is not None:
                     s.visit_ended((key, self.store.version[key], len(p.blocks)))
+            self._queue_blocks()
         elif name == "call":
             fn, done, out = args
             try:
@@ -213,12 +214,13 @@ class RecallWorker(threading.Thread):
         end = getattr(self.backend, "end_turn", None)
         if end is not None:
             end()
+        self._queue_blocks()
         io, self.io = self.io, None
         if io is None:
             return
         keep = ("release_s", "waited_for_read", "need_frame", "screen_at_up", "cancelled", "retrievals",
                 "page_changes", "pages_cut", "wasted_s", "gpu_s", "prefix_at_down", "error", "states", "pieces", "blocked",
-                "frontier_found", "page_log", "frontier_log", "frontier_at_up", "pages_at_up", "alt_ready_at_up", "job_errors")
+                "frontier_found", "page_log", "frontier_log", "frontier_at_up", "pages_at_up", "alt_ready_at_up", "job_errors", "decode_log")
         io.result.update({k: turn.get(k) for k in keep if k in turn})
         if turn.get("error") and self.sched.errors:
             io.result["traceback"] = self.sched.errors[-1][2]
@@ -279,6 +281,35 @@ class RecallWorker(threading.Thread):
             self._found[text] = self._find(text)
         return self._found[text][1]
 
+    def _used(self) -> int:
+        return self._count(self.store.timeline() + "\n\n") + self._count(PAGES_HEAD + HINT)
+
+    def _block_slot(self, fid: int, used: int) -> tuple:
+        """Cached by (view, its version, room for it): counting a view's lines is quadratic in them, and every kept
+        screen's slot is looked up after each visit and turn."""
+        vk = self.store.set_view(fid, self.backend.ss.screens[fid])
+        with self.store.lock:
+            k = (vk, self.store.version[vk], self.cap - used)
+        out = self._slots.get(k)
+        if out is None:
+            if len(self._slots) > 4096:
+                self._slots.clear()                     # bounded: memory stays flat
+            out = self._slots[k] = (BLOCK, fid, self.store.view_slot(vk, self.cap - used, self._count))
+        return out
+
+    def _queue_blocks(self):
+        """Every kept screen's block as the context would use it now (its view text grows as frames arrive, and the
+        room for it shrinks as the timeline grows): built in quiet time when missing or out of date."""
+        be, ss = self.backend, getattr(self.backend, "ss", None)
+        if ss is None or getattr(be, "blocks", None) is None:
+            return
+        used = self._used()
+        for fid in ss.ids():
+            if ss.ready(fid):
+                slot = self._block_slot(fid, used)
+                if not be.has_piece(slot):
+                    self.sched.add_build(slot)
+
     def _retrieve_steps(self, text: str):
         """(best, runner-up) for a partial transcript, as GPU pieces the scheduler interleaves with page work (its
         Retrieve job, M3 2026-11-15). Same result as _retrieve/_retrieve_alt, and fills the same cache."""
@@ -309,6 +340,8 @@ class RecallWorker(threading.Thread):
 
         def layout(fs):
             if fs and ss is not None and ss.ready(fs[0]):
+                if len(fs) == 1 and getattr(self.backend, "blocks", None) is not None:
+                    return (self._block_slot(fs[0], used),)     # one slot: screen turn, opener, view (§5.29)
                 vk = self.store.set_view(fs[0], ss.screens[fs[0]])
                 mem = (self.store.view_slot(vk, self.cap - used, self._count),)
             else:

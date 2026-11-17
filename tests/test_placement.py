@@ -1,6 +1,5 @@
 """Split placement (P4, ARCHITECTURE.md §6.1): quiet-time encodes on the Neural Engine, everything urgent
 on the GPU. Fake model and fake Neural Engine encoder with timed chunks."""
-import threading
 import time
 
 import numpy as np

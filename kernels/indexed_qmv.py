@@ -100,6 +100,122 @@ _kernel = mx.fast.metal_kernel(name="indexed_qmv_4bit_g64", input_names=["w", "i
                                output_names=["y"], source=_SOURCE)
 
 
+# ---------------------------------------------------------------- a few rows at once (M3, 2026-11-15)
+# Kernel lever 1. For 2+ input rows (a question's last words, a retrieval's question pass, the question prefill),
+# indexed_matmul used to rebuild every matrix's full scales and biases from the index on each call (table[idx], ~0.3
+# GB of metadata written and read per forward pass) and then run MLX's multi-row kernel, which at these sizes is far
+# below the memory limit: a full forward pass took 27 ms for 1 token, 64 ms for 9, 70 ms for 16 (4.6k context).
+# This kernel is the one-token kernel above with the weight block loaded once and applied to up to MR rows of x: every
+# row's floating-point operations happen in the same order as when that row runs alone, so each output row is
+# bit-identical to the one-token kernel's (and to MLX's one-token qmv_fast). It differs from MLX's own multi-row
+# kernel only in rounding (MLX's kernels for 1 and 2+ rows already differ from each other that way).
+_SOURCE_MULTI = """
+    constexpr int packs_per_thread = 2;
+    constexpr int results_per_simdgroup = 4;
+    constexpr int pack_factor = 8;
+    constexpr int bytes_per_pack = 4;
+    constexpr int values_per_thread = 16;
+    constexpr int block_size = values_per_thread * 32;
+    constexpr int group_size = 64;
+    constexpr int scale_step_per_thread = group_size / values_per_thread;
+    typedef float U;
+
+    const uint3 tid = threadgroup_position_in_grid;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int in_vec_size = K;
+    const int out_vec_size = N;
+    const int m0 = tid.x * MR;
+
+    const device uint8_t* ws = (const device uint8_t*)w;
+    thread U x_thread[MR][values_per_thread];
+    thread U sums[MR];
+    thread U result[MR][results_per_simdgroup];
+    for (int m = 0; m < MR; m++) {
+        for (int r = 0; r < results_per_simdgroup; r++) { result[m][r] = 0; }
+    }
+
+    const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+    const int in_vec_size_g = in_vec_size / group_size;
+    const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+
+    ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    const device uint16_t* ix = idx + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    const device T* xp = x + m0 * in_vec_size + simd_lid * values_per_thread;
+
+    for (int k = 0; k < in_vec_size; k += block_size) {
+        for (int m = 0; m < MR; m++) {
+            if (m0 + m < M) {
+                const device T* xm = xp + m * in_vec_size;
+                U sum = 0;
+                for (int i = 0; i < values_per_thread; i += 4) {
+                    sum += U(xm[i]) + U(xm[i + 1]) + U(xm[i + 2]) + U(xm[i + 3]);
+                    x_thread[m][i] = xm[i];
+                    x_thread[m][i + 1] = xm[i + 1] / 16.0f;
+                    x_thread[m][i + 2] = xm[i + 2] / 256.0f;
+                    x_thread[m][i + 3] = xm[i + 3] / 4096.0f;
+                }
+                sums[m] = sum;
+            }
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            const device uint16_t* wl = (const device uint16_t*)(ws + row * in_vec_size_w);
+            const uint g = ix[row * in_vec_size_g];
+            U s = table[2 * g];
+            U b = table[2 * g + 1];
+            // the masked codes as floats, once for all rows of x (the same values the one-token kernel converts)
+            U wf[values_per_thread];
+            for (int i = 0; i < (values_per_thread / 4); i++) {
+                wf[4 * i] = U(wl[i] & 0x000f);
+                wf[4 * i + 1] = U(wl[i] & 0x00f0);
+                wf[4 * i + 2] = U(wl[i] & 0x0f00);
+                wf[4 * i + 3] = U(wl[i] & 0xf000);
+            }
+            for (int m = 0; m < MR; m++) {
+                if (m0 + m < M) {
+                    U accum = 0;
+                    for (int i = 0; i < (values_per_thread / 4); i++) {
+                        accum += (x_thread[m][4 * i] * wf[4 * i] + x_thread[m][4 * i + 1] * wf[4 * i + 1] +
+                                  x_thread[m][4 * i + 2] * wf[4 * i + 2] + x_thread[m][4 * i + 3] * wf[4 * i + 3]);
+                    }
+                    result[m][row] += s * accum + sums[m] * b;
+                }
+            }
+        }
+        ws += block_size * bytes_per_pack / pack_factor;
+        ix += block_size / group_size;
+        xp += block_size;
+    }
+    for (int m = 0; m < MR; m++) {
+        if (m0 + m < M) {
+            device T* yp = y + (m0 + m) * out_vec_size + out_row;
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                U r = simd_sum(result[m][row]);
+                if (simd_lid == 0) {
+                    yp[row] = static_cast<T>(r);
+                }
+            }
+        }
+    }
+"""
+
+_kernel_multi = mx.fast.metal_kernel(name="indexed_qmv_multi_4bit_g64", input_names=["w", "idx", "table", "x"],
+                                     output_names=["y"], source=_SOURCE_MULTI)
+MULTI_MAX = 2                       # used for exactly 2 rows: 18.1 vs 25.0 ms over all 342 matmuls; from 3 rows this
+MULTI_MR = 2                        # ALU-bound design is no faster than MLX's matrix kernel (ARCHITECTURE.md §5.32)
+
+
+def indexed_qmv_multi(x: mx.array, w: mx.array, idx: mx.array, table: mx.array, mr: int = MULTI_MR) -> mx.array:
+    """x [M, K] (2 <= M <= MULTI_MAX) @ dequant(w, table[idx]).T -> [M, N]; each row as indexed_qmv computes it."""
+    M, K = x.shape
+    N = w.shape[0]
+    assert fast_ok(K, N) and w.shape[1] * 8 == K and idx.shape == (N, K // GROUP)
+    return _kernel_multi(inputs=[w, idx, table, x],
+                         template=[("T", x.dtype), ("K", K), ("N", N), ("M", M), ("MR", mr)],
+                         grid=(64 * (-(-M // mr)), N // 8, 1), threadgroup=(64, 1, 1),
+                         output_shapes=[(M, N)], output_dtypes=[x.dtype])[0]
+
+
 def build_index(scales: mx.array, biases: mx.array):
     """(idx uint16 [rows, groups], table [pairs, 2] in the scales' dtype): table[idx] == (scales, biases) exactly.
     Scales and biases must be a 2-byte float type (bf16/fp16), as in the model file."""
@@ -140,9 +256,10 @@ def indexed_matmul(x: mx.array, w: mx.array, idx: mx.array, table: mx.array) -> 
     """Any shape: the custom kernel for a few rows of x, else MLX's own kernel on the expanded scales."""
     lead, K = x.shape[:-1], x.shape[-1]
     x2 = x.reshape(-1, K)
-    if x2.shape[0] == 1 and fast_ok(K, w.shape[0]):     # one token: bit-identical to MLX (checked); MLX
-        # switches kernels for 2+ rows, so those go through MLX itself to stay exact
+    if x2.shape[0] == 1 and fast_ok(K, w.shape[0]):     # one token: bit-identical to MLX (checked)
         return indexed_qmv(x2, w, idx, table).reshape(*lead, w.shape[0])
+    if x2.shape[0] <= MULTI_MAX and fast_ok(K, w.shape[0]):     # two: each row exactly as it would run alone
+        return indexed_qmv_multi(x2, w, idx, table).reshape(*lead, w.shape[0])
     s, b = expand(idx, table)
     return mx.quantized_matmul(x, w, s, b, transpose=True, group_size=GROUP, bits=BITS)
 

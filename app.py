@@ -38,7 +38,7 @@ import numpy as np  # noqa: E402
 import screen as scr  # noqa: E402
 from asr import AsrError, make_asr  # noqa: E402
 from audio_io import Mic, Speaker, near_silent, rms_dbfs  # noqa: E402
-from engine import RECALL_INSTRUCTION, AnswerJob, GemmaAdapter, GpuWorker, make_tts  # noqa: E402
+from engine import AnswerJob, GemmaAdapter, GpuWorker, make_tts  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
@@ -392,9 +392,17 @@ def live_recall(args):
               "Screen & System Audio Recording); restart the terminal after turning it on.")
         sys.exit(2)
     LOGS.mkdir(exist_ok=True)
-    cap, grab_small = scr.open_capture()
+    ui = getattr(args, "ui_events", False)
+    # Under the menu bar app, its caption panel is left out of every screen read: the assistant must not see (and
+    # remember) its own answers. The menu bar is this process's parent.
+    cap, grab_small = scr.open_capture(exclude_pids=(os.getppid(),) if ui else ())
     speaker, mic = Speaker().start(), Mic().start()
     o = worker_opts(args)
+    ui_lock = threading.Lock()
+
+    def on_ui(ev):                                       # one line per event; menubar.py reads them (not logged)
+        with ui_lock:
+            print("@ui " + json.dumps(ev), flush=True)
 
     def on_row(row):
         status = "error: " + row["error"] if row.get("error") else "answered"
@@ -405,8 +413,11 @@ def live_recall(args):
                     freshness="C" if o["freshness"] == "C" else "B", first_chunk=o["first_chunk"],
                     trim_silence=o["trim_silence"], mlx_cache_gb=o["mlx_cache_gb"],
                     log_path=LOGS / f"turns-recall-{time.strftime('%Y%m%d-%H%M%S')}.jsonl",
-                    show_text=getattr(args, "show_text", False), on_row=on_row)
+                    show_text=getattr(args, "show_text", False), on_row=on_row, on_ui=on_ui if ui else None)
     startup = app.start()
+    if ui:
+        on_ui({"ev": "ready", "captions": os.getppid() in getattr(cap, "excluded", set()),
+               "dirs": app.data_dirs() + [str(d) for d in [getattr(cap, "dir", None)] if d]})
     events, hotkey_proc, hotkey_msg = talk_events(args)
     print(f"ready in {startup['ready_s']} s  {startup}\n"
           f"Enter = talk / stop / interrupt, q = quit;  {hotkey_msg}", flush=True)
@@ -683,6 +694,9 @@ def main():
     ap.add_argument("--replay", choices=["reading", "reasoning", "voice", "contention"])
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--sandbox-profile", default="")
+    ap.add_argument("--ui-events", action="store_true",
+                    help="print caption events as '@ui {json}' lines and hide the parent app's windows from screen reads "
+                         "(used by menubar.py)")
     ap.add_argument("--screen-only", action="store_true",
                     help="the previous app: answer from the current screen only, no memory of past screens")
     args = ap.parse_args()

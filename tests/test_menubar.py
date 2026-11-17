@@ -3,10 +3,11 @@ import os
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 import pytest
 
-from menubar import Runner, state_from_line
+from menubar import Captions, Runner, safe_data_dir, state_from_line, ui_event, wipe
 
 FAKE_APP = textwrap.dedent("""
     import subprocess, sys, time
@@ -103,3 +104,85 @@ def test_app_exiting_on_its_own_with_error(run, tmp_path):
     r = Runner([sys.executable, "-u", str(script)], states.append, log_dir=tmp_path / "logs")
     r.start()
     assert wait_for(lambda: r.state == "error")
+
+
+# ---------------------------------------------------------------- caption events and the wipe
+
+UI_APP = textwrap.dedent("""
+    import json, sys, tempfile, time
+    d = tempfile.mkdtemp(prefix="lv-screens-")
+    open(d + "/kept.npy", "w").write("x")
+    print("@ui " + json.dumps({"ev": "dirs", "paths": [d, "/etc"]}), flush=True)
+    print("starting", flush=True)
+    print("ready in 0.1 s", flush=True)
+    print("@ui " + json.dumps({"ev": "heard", "text": "secret question"}), flush=True)
+    print("dir", d, flush=True)
+    time.sleep(600 if sys.argv[1] == "hang" else 0)
+    for line in sys.stdin:
+        if line.strip() == "q":
+            break
+""")
+
+
+@pytest.mark.parametrize("mode", ["quits", "hang"])
+def test_ui_lines_forwarded_not_logged_and_dirs_wiped(tmp_path, mode):
+    script = tmp_path / "ui_app.py"
+    script.write_text(UI_APP)
+    events = []
+    r = Runner([sys.executable, "-u", str(script), mode], lambda s: None, log_dir=tmp_path / "logs",
+               quit_grace_s=1.0, term_grace_s=1.0, on_ui=events.append)
+    r.start()
+    assert wait_for(lambda: r.state == "on")
+    assert wait_for(lambda: any(e.get("ev") == "heard" for e in events))
+    log = next((tmp_path / "logs").glob("menubar-*.log"))
+    assert wait_for(lambda: "dir " in log.read_text())
+    d = Path(next(l for l in log.read_text().splitlines() if l.startswith("dir ")).split(" ", 1)[1])
+    assert d.is_dir()
+    r.stop(block=True)                                  # "hang": killed, so the app's own cleanup never ran
+    assert not d.exists(), "kept screens survived Off"
+    assert "secret question" not in log.read_text()
+    assert Path("/etc").is_dir()
+
+
+def test_safe_data_dir_only_accepts_app_temp_folders(tmp_path):
+    import tempfile
+    real = tempfile.mkdtemp(prefix="lv-pieces-")
+    try:
+        assert safe_data_dir(real) is not None
+        assert safe_data_dir(str(tmp_path)) is None                       # not a known prefix
+        assert safe_data_dir("/etc") is None
+        assert safe_data_dir(os.path.join(real, "..", "..")) is None
+        nested = os.path.join(real, "lv-screens-x")
+        os.mkdir(nested)
+        assert safe_data_dir(nested) is None                              # not directly in the temp dir
+        assert wipe([real, "/etc"]) == [os.path.realpath(real)]
+    finally:
+        import shutil
+        shutil.rmtree(real, ignore_errors=True)
+
+
+def test_ui_event_parsing():
+    assert ui_event('@ui {"ev": "say", "text": "Hi."}') == {"ev": "say", "text": "Hi."}
+    assert ui_event("ready in 1 s") is None
+    assert ui_event("@ui not json") is None
+    assert ui_event("@ui [1]") is None
+
+
+def test_captions_follow_a_turn():
+    c = Captions()
+    assert c.apply({"ev": "listening"}) == "show" and c.head == "Listening…"
+    c.apply({"ev": "heard", "text": "what was the"})
+    c.apply({"ev": "thinking"})
+    c.apply({"ev": "heard", "text": "what was the price?", "final": True})
+    assert c.question == "what was the price?" and c.head == "Thinking…"
+    c.apply({"ev": "say", "text": "It was"})
+    c.apply({"ev": "say", "text": "$42."})
+    assert c.answer == "It was $42." and c.head == ""
+    assert c.apply({"ev": "done", "error": None}) == "linger"
+    assert 3.0 < c.linger_s() <= 12.0
+    assert c.apply({"ev": "listening"}) == "show" and c.answer == "" and c.question == ""
+    assert c.apply({"ev": "idle"}) == "hide"
+    c.apply({"ev": "listening"})
+    assert c.apply({"ev": "done", "error": "empty transcript (mic muted or no permission?)"}) == "linger"
+    assert c.answer == "Didn't catch that."
+    assert c.apply({"ev": "dirs", "paths": []}) is None

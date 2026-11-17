@@ -117,6 +117,7 @@ class Capturer:
         self.fmt = fmt
         self.dir = directory or private_dir()
         self.stats = {"n": 0, "total_s": 0.0, "max_s": 0.0, "child_cpu_s": 0.0}
+        self.excluded: set = set()                    # screencapture can't leave windows out
 
     def grab(self) -> Image.Image:
         path = self.dir / f"frame.{self.fmt}"
@@ -196,8 +197,10 @@ class StreamCapturer:
       ScreenWatcher(on_frame, grab=cap.grab, grab_small=cap.grab_small)
     """
 
-    def __init__(self, interval_s: float = ACTIVE_POLL_S, timeout_s: float = 5.0):
+    def __init__(self, interval_s: float = ACTIVE_POLL_S, timeout_s: float = 5.0, exclude_pids: tuple = ()):
         self.interval_s, self.timeout_s = interval_s, timeout_s
+        self.exclude_pids = set(exclude_pids)          # apps whose windows the assistant never sees (its caption panel)
+        self.excluded: set = set()                     # those found and excluded
         self.stats = {"n": 0, "total_s": 0.0, "max_s": 0.0, "cpu_s": 0.0, "stream_frames": 0, "small_reads": 0}
         self._latest: Optional[np.ndarray] = None
         self._lock = threading.Lock()
@@ -228,7 +231,13 @@ class StreamCapturer:
             raise RuntimeError(f"no shareable content: {err}")
         main = Quartz.CGMainDisplayID()
         display = next(d for d in content.displays() if d.displayID() == main)
-        self._filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(display, [])
+        if self.exclude_pids:                         # whole apps, so windows they open later are left out too
+            apps = [a for a in content.applications() if a.processID() in self.exclude_pids]
+            self.excluded = {a.processID() for a in apps}
+            self._filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingApplications_exceptingWindows_(
+                display, apps, [])
+        else:
+            self._filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(display, [])
         scale = 2                                     # device px per point (Retina); full = points * scale
         full_w, full_h = display.width() * scale, display.height() * scale
         cfg = SCK.SCStreamConfiguration.alloc().init()
@@ -294,11 +303,12 @@ class StreamCapturer:
             self._stream = None
 
 
-def open_capture():
+def open_capture(exclude_pids: tuple = ()):
     """The app's screen source: (capturer, grab_small or None). A ScreenCaptureKit stream (§8.6, ~5x less CPU
-    than a `screencapture` process per poll); falls back to `screencapture` only if the stream can't start."""
+    than a `screencapture` process per poll); falls back to `screencapture` only if the stream can't start.
+    `exclude_pids`: apps left out of every capture (the stream only; `screencapture` can't, see `cap.excluded`)."""
     try:
-        cap = StreamCapturer().start()
+        cap = StreamCapturer(exclude_pids=exclude_pids).start()
         return cap, cap.grab_small
     except Exception as e:                            # older macOS, missing bindings, permission quirks
         print(f"ScreenCaptureKit unavailable ({e}); using screencapture", flush=True)
