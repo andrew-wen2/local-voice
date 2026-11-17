@@ -1,4 +1,4 @@
-"""screen_store.py — kept screens as memory (ARCHITECTURE.md §5.12, §12.15–12.19).
+"""screen_store.py — kept screens as memory.
 
 A kept screen is its vision features (the encoder's output, ~1,066 image tokens; written to disk, owner-only, int8 with a
 scale per token: Andrew's default, 2026-11-11, ~2.7 MB instead of ~5.5 MB a screen) and its
@@ -27,7 +27,7 @@ import numpy as np
 
 from memory import BM25, terms
 
-KEY_LAYERS = (11, 17)             # §12.19's decision: layers 11 + 17, every image token, int8
+KEY_LAYERS = (11, 17)             # layers 11 + 17, every image token, int8
 HORIZON_S = 3600.0
 
 
@@ -41,7 +41,7 @@ def quantize_int8(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 class Screen:
     fid: int
     t: float                      # seconds since the store's start (the page store's clock)
-    key: str                      # page key (§12.9)
+    key: str                      # page key
     title: str
     lines: list
     keys: dict = field(default_factory=dict)      # layer -> (int8 [kv heads, n_img, D], float16 scales [.., 1]); memory-mapped once added
@@ -111,7 +111,7 @@ class ScreenStore:
             self._bm25 = None
 
     def add_lines(self, fid: int, lines: list):
-        """Text of a frame that wasn't kept, given to the kept screen that stands in for it (its unit, §5.21 X1). The
+        """Text of a frame that wasn't kept, given to the kept screen that stands in for it (its unit). The
         screen may not be ready yet (still being encoded): the lines wait for it."""
         with self.lock:
             if fid in self.screens:
@@ -148,7 +148,7 @@ class ScreenStore:
     # -- finding
     def ids(self, exclude_visit: Optional[tuple] = None) -> list[int]:
         """Ready screens, oldest first. exclude_visit=(page key, visit start): leave out the frames of the visit still
-        on screen, which the current screen supersedes (§5.12, after the first live test)."""
+        on screen, which the current screen supersedes (after the first live test)."""
         with self.lock:
             out = sorted(self.screens, key=lambda f: self.screens[f].t)
             if exclude_visit is not None:
@@ -170,7 +170,7 @@ class ScreenStore:
             return np.array([sc[at[f]] for f in fids], dtype=np.float64)
 
     def text_ranking(self, question: str) -> list[int]:
-        """F1 (§12.15): BM25 over each screen's title (twice) and page-area OCR lines, ties to the latest."""
+        """F1: BM25 over each screen's title (twice) and page-area OCR lines, ties to the latest."""
         with self.lock:
             fids = self.ids()
             if self._bm25 is None or self._bm25[0] != fids:
@@ -188,7 +188,7 @@ def _union(a: list, b: list) -> list:
 
 
 def fuse(text_rank: list[int], key_rank: list[int], k: int) -> list[int]:
-    """§12.17's combination: each screen's better rank of the two routes; ties go to the keys' order (they found
+    """Text and key ranks combined: each screen's better rank of the two routes; ties go to the keys' order (they found
     what text couldn't). Returns the top k screens."""
     pos_t = {f: i for i, f in enumerate(text_rank)}
     pos_k = {f: i for i, f in enumerate(key_rank)}

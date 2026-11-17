@@ -1,4 +1,4 @@
-"""Conversation history + context jobs in the scheduler (ARCHITECTURE.md §5, §9), with a fake model
+"""Conversation history + context jobs in the scheduler, with a fake model
 whose "cache" is a list of labels, so each test can check the exact context the model would see."""
 import time
 

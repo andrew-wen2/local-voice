@@ -1,4 +1,4 @@
-"""Custom Metal kernel #2: 4-bit matrix-vector product with indexed group scales (ARCHITECTURE.md §3.8).
+"""Custom Metal kernel #2: 4-bit matrix-vector product with indexed group scales.
 
 The idea (lossless). MLX stores each group of 64 weights with its own bf16 scale and bf16 bias: 32 bits of
 metadata per 64 four-bit codes, 0.29 GB of Gemma's 2.6 GB of text weights. But each weight tensor uses only
@@ -202,7 +202,7 @@ _SOURCE_MULTI = """
 _kernel_multi = mx.fast.metal_kernel(name="indexed_qmv_multi_4bit_g64", input_names=["w", "idx", "table", "x"],
                                      output_names=["y"], source=_SOURCE_MULTI)
 MULTI_MAX = 2                       # used for exactly 2 rows: 18.1 vs 25.0 ms over all 342 matmuls; from 3 rows this
-MULTI_MR = 2                        # ALU-bound design is no faster than MLX's matrix kernel (ARCHITECTURE.md §5.32)
+MULTI_MR = 2                        # ALU-bound design is no faster than MLX's matrix kernel
 
 
 def indexed_qmv_multi(x: mx.array, w: mx.array, idx: mx.array, table: mx.array, mr: int = MULTI_MR) -> mx.array:

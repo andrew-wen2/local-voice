@@ -382,7 +382,7 @@ def test_cancel_stops_within_one_token(gemma):
 # -- latency fixes (2026-11-06): early first phrase + Kokoro silence trim
 
 def test_first_phrase_splits_only_at_punctuation():
-    """§5.33: a split only where a speaker pauses; otherwise the first sentence is spoken whole."""
+    """A split only where a speaker pauses; otherwise the first sentence is spoken whole."""
     assert engine.split_first_phrase("The rent was $3,488 a month, with ")[0] == "The rent was $3,488 a month,"
     assert engine.split_first_phrase("The file looks fine; but line ")[0] == "The file looks fine;"
     assert engine.split_first_phrase("Yes, the flight leaves ") is None                   # comma before 3 words

@@ -58,9 +58,9 @@ SPOKEN_INSTRUCTION = (
     "Answer in one to three short spoken sentences. Write numbers as digits. "
     "No lists, no markdown, no code blocks."
 )
-# Recall mode (ARCHITECTURE.md §5.12): earlier screens and pages sit above the current screen, so "the image above" is
+# Recall mode: earlier screens and pages sit above the current screen, so "the image above" is
 # ambiguous; say which image is now. Same answer rules as SPOKEN_INSTRUCTION.
-RECALL_INSTRUCTION = (            # wording v1 of §5.24 (Andrew, 2026-11-12: no screen talk unless asked, no images, short)
+RECALL_INSTRUCTION = (            # Andrew, 2026-11-12: no screen talk unless asked, no images, short
     "You are a helpful voice assistant. The image just above is the user's current screen, what is on screen right "
     "now; earlier screens and pages above it are no longer on screen. Use them only when the question is about what is "
     "or was on the user's screen; answer any other question directly, without bringing up the screen. Never mention "
@@ -100,7 +100,7 @@ _PHRASE_PUNCT = re.compile(r"[,;:\u2014\u2013](?=\s)")
 
 def split_first_phrase(buffer: str, min_words: int = 3) -> Optional[tuple[str, str]]:
     """Early first chunk for TTS: split an unfinished first sentence at punctuation (, ; : dash) after >= min_words
-    words, where a speaker pauses anyway (ARCHITECTURE.md §5.33). Returns (phrase, rest), or None: the first sentence
+    words, where a speaker pauses anyway. Returns (phrase, rest), or None: the first sentence
     is then spoken whole. (A split before a break word such as "is" or "that" was faster but left an audible seam.)"""
     for m in _PHRASE_PUNCT.finditer(buffer):
         if len(buffer[:m.end()].split()) >= min_words:
@@ -144,7 +144,7 @@ def _has_tensor(path: Path, key: str) -> bool:
 
 
 class MMapPerLayerEmbedding:
-    """M2 (ARCHITECTURE.md §3.4): Gemma's per-layer embedding (PLE) table read from the model file.
+    """Gemma's per-layer embedding (PLE) table read from the model file.
 
     The table is 262,144 rows x 6,048 B (4-bit, group 64): 1.59 GB, but each token needs one row.
     Instead of keeping it in MLX memory, the three tensors (weight, scales, biases) are mapped
@@ -186,7 +186,7 @@ class MMapPerLayerEmbedding:
 
 
 def _uses(part: str):
-    """Mark a GemmaAdapter method as needing one swappable part ("vision" or "head") loaded (§3.9).
+    """Mark a GemmaAdapter method as needing one swappable part ("vision" or "head") loaded.
     Works for generators too: the part is acquired on the first step and released when the generator ends
     or is dropped (finally runs on close / garbage collection)."""
     import functools
@@ -216,9 +216,9 @@ def _uses(part: str):
 
 class SwappableEmbedding(nn.Module):
     """Gemma's token embedding, which is also its output layer (tied, 262,144 rows, 4-bit: 0.34 GB of codes).
-    Input lookups read the rows they need from the model file (as the per-layer table, M2: bit-identical); the
+    Input lookups read the rows they need from the model file (as the per-layer table, bit-identical); the
     full table is only needed for the output layer, so its codes can be swapped out while the image encoder is
-    in (§3.9). as_linear loads them on demand if they are out. Scales/biases (or the §3.8 index) stay in."""
+    in. as_linear loads them on demand if they are out. Scales/biases (or their scale index) stay in."""
 
     def __init__(self, qe, file: Path, prefix: str, loader):
         super().__init__()
@@ -303,26 +303,26 @@ class GemmaAdapter:
         self.lean = lean
         self.chat: Optional[dict] = None
         self.image_processor = None
-        # M1 (ARCHITECTURE.md §3.3): don't build Gemma's audio encoder (0.61 GB; Parakeet does speech).
+        # Don't build Gemma's audio encoder (0.61 GB; Parakeet does speech).
         self.skip_audio = skip_audio
-        # G1 (§4.2): during prefill, run the 18 KV-shared layers only for the last token. They store
+        # During prefill, run the 18 KV-shared layers only for the last token. They store
         # no cache, so the snapshot is bit-identical (checked 2026-11-06). No speed gain in reads (S0): MLX is
         # lazy and a read evaluates only the cache, so those layers never ran anyway. Kept as a guard.
         self.skip_shared = skip_shared
-        # M2 (§3.4): read the 1.59 GB per-layer embedding table's rows from the model file on demand.
+        # Read the 1.59 GB per-layer embedding table's rows from the model file on demand.
         self.stream_ple = stream_ple
-        # Kernel track (§4.4, vision_fast.py): position lookup as a gather and no all-zero attention mask
+        # vision_fast.py: position lookup as a gather and no all-zero attention mask
         # (bit-identical); compile_vision also runs each vision layer under mx.compile: not bit-identical, but
-        # as close to an fp32 run as the uncompiled path (0.7-1.8% RMS each), 19/20 reading either way (§4.4).
+        # as close to an fp32 run as the uncompiled path (0.7-1.8% RMS each), 19/20 reading either way.
         self.fast_vision = fast_vision
         self.compile_vision = compile_vision
-        # Custom Metal kernel for the vision q/k/v norm + 2D RoPE + layout (kernels/vision_qkv.py, §4.4).
+        # Custom Metal kernel for the vision q/k/v norm + 2D RoPE + layout (kernels/vision_qkv.py).
         self.vision_kernel = vision_kernel
-        # §3.8: store each text weight tensor's (scale, bias) pairs as a 16-bit index into a per-tensor table
+        # Store each text weight tensor's (scale, bias) pairs as a 16-bit index into a per-tensor table
         # (lossless; -143 MB); one-token matmuls run kernels/indexed_qmv.py, bit-identical to MLX's. Needs the
         # setup-time sidecar (python -m kernels.indexed_qmv build); skipped without it.
         self.indexed_scales = indexed_scales
-        # §3.9: the image encoder (0.34 GB) is needed only while encoding a screen, the output layer (0.34 GB of
+        # The image encoder (0.34 GB) is needed only while encoding a screen, the output layer (0.34 GB of
         # codes) only to pick tokens; keep one in at a time.
         self.swap_weights = swap_weights
 
@@ -440,7 +440,7 @@ class GemmaAdapter:
         assert full.startswith(pre)
         return self.tok.encode(full[len(pre):], add_special_tokens=False)
 
-    # -- §3.9: swap the image encoder and the output layer
+    # -- swap the image encoder and the output layer
     def _swap_init(self):
         from mlx.utils import tree_flatten
         self._model_file = next(p for p in self.path.glob("*.safetensors") if p.name != "indexed_scales.safetensors")
@@ -581,7 +581,7 @@ class GemmaAdapter:
                 return
             y = nxt
 
-    # -- context pieces (conversation history, ARCHITECTURE.md §9). Every piece runs text layers
+    # -- context pieces (conversation history). Every piece runs text layers
     # 0-23 only (layers 24-41 share KV and store nothing) and yields once per piece.
     # Layout: <bos> [older exchanges] [screen turn: image + instructions + "Question:"] q1 -> a1 [<|turn>user q2 …]
     def text_ids(self, s: str) -> list[int]:
@@ -839,7 +839,7 @@ class AneTts:
     """Kokoro 82M through FluidAudio's KokoroAne (Core ML: Neural Engine + CPU), as a child process
     (`tools/parakeet/Sources/kokoro-serve`). No GPU time and no MLX memory:
     0.19 GB loaded, 0.32 GB peak for the whole process, against MLX Kokoro's 0.33 GB + 0.4-1.7 GB of
-    scratch per sentence (ARCHITECTURE.md §3.7). Text-to-phonemes runs in Swift, so Python never imports
+    scratch per sentence. Text-to-phonemes runs in Swift, so Python never imports
     a text-to-phonemes library.
 
     Protocol: one UTF-8 line of text in; one "@@" + JSON line {"n", "seconds", "audio_s"} then n float32
@@ -957,7 +957,7 @@ class AneTts:
 
 
 def make_tts(sandbox_profile: Optional[Path] = None, log_dir: Optional[Path] = None):
-    """Kokoro on the Neural Engine (ARCHITECTURE.md §3.7). Set up by ./setup.sh."""
+    """Kokoro on the Neural Engine. Set up by ./setup.sh."""
     t = AneTts(sandbox_profile=sandbox_profile, log_path=log_dir / "kokoro.log" if log_dir else None)
     if not t.available():
         raise RuntimeError(f"Kokoro on the Neural Engine isn't set up ({t.binary}, {t.model_dir}); run ./setup.sh.")
@@ -1013,7 +1013,7 @@ FRESHNESS = ("A", "B", "C")
 
 
 class GpuWorker(threading.Thread):
-    """Owns MLX; this loop is the scheduler (ARCHITECTURE.md §5).
+    """Owns MLX; this loop is the scheduler.
 
     Work, highest priority first: answer > spare cache copy > screen-read pieces.
 
@@ -1061,7 +1061,7 @@ class GpuWorker(threading.Thread):
         self._piece_ema: Optional[float] = None
         self._last_total = 32
         self._last_read_start = -1e9
-        # conversation history (ARCHITECTURE.md §9): needs an adapter with the context pieces
+        # conversation history: needs an adapter with the context pieces
         self.history = history and hasattr(adapter, "encode_steps")
         self.history_max_tokens, self.since_max_tokens = history_max_tokens, since_max_tokens
         self.ctx_old: list[tuple[str, str, int]] = []      # (q, a, tokens) before the current screen turn
@@ -1154,7 +1154,7 @@ class GpuWorker(threading.Thread):
                     job = action[1]
                     try:
                         self._answer(job)
-                    except Exception as e:              # one failed answer must not stop the worker (§3.7):
+                    except Exception as e:              # one failed answer must not stop the worker:
                         import traceback                # the job ends with an error, the loop goes on
                         traceback.print_exc()
                         job.result["error"] = f"answer failed: {e!r}"

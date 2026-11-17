@@ -42,7 +42,7 @@ def corpus():
         s = json.loads(Path(f).read_text())
         texts += [p.get("text", "") for p in s["pages"]] + [p.get("title", "") for p in s["pages"]]
         texts += [q.get("question", "") for q in s.get("probes", [])]
-    texts += (ROOT / "ARCHITECTURE.md").read_text().split("\n\n")[:400]
+    texts += (ROOT / "README.md").read_text().split("\n\n") + (ROOT / "engine.py").read_text().split("\n\n")[:400]
     texts += ["a  b   c", "  lead", "trail  ", "\n\n\n", "x > </y>", "<div> </div>", "emoji 🍩🤖", "日本語", "naïve",
               "​", "<0x41>", "a\r\nb", "\x00\x07", "▁x▁", "$3,488/mo", "<|turn>user\nhi<turn|>"]
     rnd = random.Random(0)

@@ -1,4 +1,4 @@
-"""recall_worker.py — the GPU thread for recall mode (ARCHITECTURE.md §5.9): owns MLX, the turn scheduler
+"""recall_worker.py — the GPU thread for recall mode: owns MLX, the turn scheduler
 (scheduler.py) and its backend (recall_backend.py). Other threads send events; this thread applies them between
 pieces and runs one piece at a time, so a piece is never interrupted and events wait at most one piece.
 
@@ -20,7 +20,7 @@ from recall import HINT, PAGES_HEAD
 from recall_backend import BLOCK, KEY, OPENER, SCREEN, RecallBackend, TurnIO
 from scheduler import Scheduler
 
-CAP = 4000          # memory slot cap, tokens (timeline + pages), as the M1 runs (§3.11)
+CAP = 4000          # memory slot cap, tokens (timeline + pages)
 
 
 class RecallWorker(threading.Thread):
@@ -267,7 +267,7 @@ class RecallWorker(threading.Thread):
         """The memory slots for this (partial) question, in context order: kept screens (found by text and Gemma's
         keys, oldest first), the pages turn's opener, then pages [(page key, version, lines shown)], oldest first.
         The page cap counts the timeline and the pages header, as eval/recall/rag_arm.py does; screens come on top
-        of it, as in the reading test (§12.16). Cached by text for the turn: the final transcript is usually the
+        of it, as in the reading test. Cached by text for the turn: the final transcript is usually the
         last partial."""
         if text not in self._found:
             self._found[text] = self._find(text)
@@ -332,7 +332,7 @@ class RecallWorker(threading.Thread):
         find = getattr(self.backend, "find_screens", None)
         if steps is None and find is None:            # backends without kept screens (tests)
             return tuple(self.store.pick(text, self.cap, self._count, used=used)), None
-        # §5.25 (Andrew, 2026-11-12): the memory text is the top kept screen's own view text, up to the same
+        # Andrew, 2026-11-12: the memory text is the top kept screen's own view text, up to the same
         # budget; whole pages only while no screen has been kept yet.
         fids = (yield from steps(text)) if steps is not None else find(text)
         yield "rlay"
@@ -341,7 +341,7 @@ class RecallWorker(threading.Thread):
         def layout(fs):
             if fs and ss is not None and ss.ready(fs[0]):
                 if len(fs) == 1 and getattr(self.backend, "blocks", None) is not None:
-                    return (self._block_slot(fs[0], used),)     # one slot: screen turn, opener, view (§5.29)
+                    return (self._block_slot(fs[0], used),)     # one slot: screen turn, opener, view
                 vk = self.store.set_view(fs[0], ss.screens[fs[0]])
                 mem = (self.store.view_slot(vk, self.cap - used, self._count),)
             else:

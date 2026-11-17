@@ -28,7 +28,7 @@ IDLE_POLL_S = 1.0
 ACTIVE_POLL_S = 0.3
 SETTLE_S = 0.3
 MAX_DELAY_S = 3.0
-# "cells" rule (ARCHITECTURE.md §8.4; real-use log 2026-11-06: 13.4 -> 4.5 reads/min vs any-pixel)
+# "cells" rule (real-use log 2026-11-06: 13.4 -> 4.5 reads/min vs any-pixel)
 CELL_SCALE = 4              # compare a 4x-shrunk copy...
 CELL_PX = 16                # ...in 16 px cells = 64 screen px, about one image token at 1120
 CELL_MIN = 40               # changed cells needed (or 5% of the screen, whichever is smaller)
@@ -188,7 +188,7 @@ def _stream_output_class():
 
 
 class StreamCapturer:
-    """ScreenCaptureKit, in process (ARCHITECTURE.md §8.6): one stream of the main display, scaled by macOS
+    """ScreenCaptureKit, in process: one stream of the main display, scaled by macOS
     to the change gate's size (1/CELL_SCALE), delivered only when something on screen changed, at most every
     `interval_s`; and a full-resolution screenshot (SCScreenshotManager) only when a frame is handed over.
     No files, no process per poll. Frames stay in memory (D4).
@@ -304,7 +304,7 @@ class StreamCapturer:
 
 
 def open_capture(exclude_pids: tuple = ()):
-    """The app's screen source: (capturer, grab_small or None). A ScreenCaptureKit stream (§8.6, ~5x less CPU
+    """The app's screen source: (capturer, grab_small or None). A ScreenCaptureKit stream (~5x less CPU
     than a `screencapture` process per poll); falls back to `screencapture` only if the stream can't start.
     `exclude_pids`: apps left out of every capture (the stream only; `screencapture` can't, see `cap.excluded`)."""
     try:
@@ -385,7 +385,7 @@ class ScreenWatcher(threading.Thread):
         self._force.set()
 
     def capture_now(self):
-        """Talk key pressed (ARCHITECTURE.md §8.4): capture right away and hand the frame over if it
+        """Talk key pressed: capture right away and hand the frame over if it
         changed since the last one sent, skipping the settle wait. The GPU is idle while you talk."""
         self._force.set()
 
@@ -396,7 +396,7 @@ class ScreenWatcher(threading.Thread):
         return self._step_mvp(state)
 
     def _step_cells(self, state: dict) -> float:
-        """Read only changes worth reading (ARCHITECTURE.md §8.4): count changed token-sized cells
+        """Read only changes worth reading: count changed token-sized cells
         against the last frame SENT (flicker that reverts cancels out), ignore animated cells, and
         send when enough changed and it has been quiet for a while, on a structural change after a
         short settle, after the staleness cap, or at once on the talk key."""

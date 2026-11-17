@@ -1,10 +1,10 @@
-"""Stored KV pieces joined at question time (ARCHITECTURE.md §3.11).
+"""Stored KV pieces joined at question time.
 
 A piece is the KV cache of a run of tokens (a retrieved page, the current screen turn) computed once, ahead of
 time, after a short fixed anchor (<bos> plus the fixed text that always precedes its slot) instead of after
 whatever happens to precede it at question time. At question time the pieces are appended to a copy of a
 cached prefix with their keys re-rotated to their new positions (cached keys are post-RoPE, values are never
-rotated; §3.10 measured the rotation exact). Only the question is prefilled.
+rotated; the rotation was measured exact). Only the question is prefilled.
 
 What is approximate: a piece never saw the text placed before it at question time (CacheBlend's "missing
 cross-attention"). What is exact: the positions, and every token computed at question time attends to the

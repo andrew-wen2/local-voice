@@ -1,4 +1,4 @@
-"""Kept screens without the model (ARCHITECTURE.md §5.12): the store (screen_store.py), combining text and key
+"""Kept screens without the model: the store (screen_store.py), combining text and key
 rankings, the Neural Engine encoder thread, and how the scheduler and worker treat screen slots."""
 import os
 import stat

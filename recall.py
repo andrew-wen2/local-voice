@@ -1,8 +1,8 @@
-"""recall.py — the app's memory of past screens, for recall questions (ARCHITECTURE.md §9.9, §12.9, §5.9).
+"""recall.py — the app's memory of past screens, for recall questions.
 
 Frames the app reads (screen.ScreenWatcher) -> OCR (Apple Vision) -> pages and visits -> the context text.
 
-  page key   §12.9's rules, unchanged (moved here from eval/real/retrieval.py so the app and the eval share them):
+  page key   the eval's rules, unchanged (moved here from eval/real/retrieval.py so the app and the eval share them):
              browsers by tab title, other apps by window; text = OCR lines inside the front window, below a
              browser's address bar. A frame whose front window changed across the grab is skipped.
   visits     a run of frames on one page; it ends when a frame from another page arrives. Each frame lasts
@@ -16,7 +16,7 @@ Frames the app reads (screen.ScreenWatcher) -> OCR (Apple Vision) -> pages and v
              BM25 first until the cap, shown oldest first, each under a time header.
 
 No model here. OCR runs on its own thread (Ocr) and pauses during a turn, so it never competes with speech
-recognition for the Neural Engine (§6.1).
+recognition for the Neural Engine.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ import numpy as np
 
 from memory import Memory, Page
 
-# ---------------------------------------------------------------- page key and text (§12.9)
+# ---------------------------------------------------------------- page key and text
 
 BROWSERS = {"Google Chrome", "Safari", "Arc", "Firefox", "Microsoft Edge", "Brave Browser", "Chromium", "Opera",
             "Vivaldi", "Orion", "Zen"}
@@ -98,7 +98,7 @@ ROW_SEP = " | "
 
 
 def ocr_rows(lines, boxes) -> list[str]:
-    """OCR lines on one visual row joined left to right (ARCHITECTURE.md §12.13): two lines share a row when their
+    """OCR lines on one visual row joined left to right: two lines share a row when their
     vertical centres differ by less than half the smaller line's height. Rows top to bottom. Vision returns each
     table cell as its own line, so without this a value loses the label on its row."""
     items = sorted(zip(lines, boxes), key=lambda lb: lb[1][1] + lb[1][3] / 2)
@@ -197,7 +197,7 @@ def clock_times(question: str, start: datetime, end_s: float) -> list[float]:
 
 def timeline_excerpt(m: Memory, visits, question: str, at: Callable[[float], datetime], title: Callable[[str], str],
                      start: datetime, top: int = 3, around: int = 2, minutes: float = 2.0) -> str:
-    """Retrieve the timeline (ARCHITECTURE.md §12.13): the visits of the `top` best BM25 pages with `around` visits
+    """Retrieve the timeline: the visits of the `top` best BM25 pages with `around` visits
     on each side, and the visits within `minutes` of each clock time in the question; in the timeline's format,
     deduplicated, oldest first. Empty if nothing matched."""
     keys = {p.url for p, _ in m.rank_pages(question)[:top]}
@@ -259,7 +259,7 @@ class Store:
         self.n_visits: dict[str, int] = {}
         self.version: dict[str, int] = {}                  # key -> number of finished visits
         self.cur: Optional[_Visit] = None
-        self.views: dict[str, Page] = {}                   # "view:<fid>" -> a kept screen's view text (§5.25)
+        self.views: dict[str, Page] = {}                   # "view:<fid>" -> a kept screen's view text
         self.lock = threading.RLock()
 
     def at(self, t: float) -> datetime:
@@ -278,7 +278,7 @@ class Store:
 
     @staticmethod
     def frame_info(wins: list, lines: list, boxes: list) -> tuple[str, str, list]:
-        """(page key, title, page-area lines) of a frame, by §12.9's rules."""
+        """(page key, title, page-area lines) of a frame, by the page key rules at the top."""
         win = wins[0]
         bar = address_bar(win, lines, boxes) if win["app"] in BROWSERS else None
         key = page_key(win, bar, wins)
@@ -326,7 +326,7 @@ class Store:
             return "\n\n" + self.head(key) + p.text(p.blocks if n_lines is None else p.blocks[:n_lines])
 
     def set_view(self, fid: int, screen) -> str:
-        """§5.25 (Andrew, 2026-11-12): a kept screen's view text as a memory slot: the page-area lines of the kept frame
+        """A kept screen's view text as a memory slot (Andrew, 2026-11-12): the page-area lines of the kept frame
         and the frames it stands in for, headed like its page (time, title, address). Its version bumps when the text
         grows (dropped frames keep arriving). Returns its key "view:<fid>"."""
         vk = f"view:{fid}"
@@ -366,13 +366,13 @@ class Store:
             return [(p.url, self.version[p.url], len(kept)) for p, kept in shown]
 
 
-# ---------------------------------------------------------------- which screens to keep (§12.15)
+# ---------------------------------------------------------------- which screens to keep
 
 CALL_APPS = re.compile(r"\b(?:meet|zoom|facetime|teams|webex)\b", re.I)
 
 
 class FrameKeeper:
-    """Keep rule K (ARCHITECTURE.md §12.15): a frame becomes memory if, against the frames already kept for its page,
+    """Keep rule K: a frame becomes memory if, against the frames already kept for its page,
     it shows a page-area OCR line not seen before, or it differs from the page's last kept frame by the change gate's
     own rule (screen.py: at least min(CELL_MIN, CELL_FRAC of the screen) changed cells, status area ignored).
     Video-call windows are never kept."""
@@ -461,7 +461,7 @@ def ocr_image(img) -> tuple[list[str], list[list[float]]]:
 class Ocr(threading.Thread):
     """Reads frames into a Store, oldest first, while `quiet()` holds (no turn active). Frames are dropped
     after reading; nothing is written to disk. `on_visit_end(key)` is called when a frame ends a visit.
-    `on_keep(fid, image, meta)`, if given, is called for frames keep rule K (§12.15) keeps as screen memory; video-call
+    `on_keep(fid, image, meta)`, if given, is called for frames keep rule K keeps as screen memory; video-call
     windows are never kept."""
 
     def __init__(self, store: Store, quiet: Callable[[], bool], on_visit_end: Callable[[str], None],
@@ -470,7 +470,7 @@ class Ocr(threading.Thread):
         super().__init__(daemon=True, name="ocr")
         self.store, self.quiet, self.on_visit_end, self.ocr = store, quiet, on_visit_end, ocr
         self.on_keep, self.keeper = on_keep, FrameKeeper()
-        # §5.21 X1 units: a dropped frame's text goes to the kept screen standing in for it (the page's last kept frame;
+        # Units: a dropped frame's text goes to the kept screen standing in for it (the page's last kept frame;
         # before the page's first keep, the next one). on_unit_text(fid, lines).
         self.on_unit_text = on_unit_text
         self._last_kept: dict[str, int] = {}

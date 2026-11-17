@@ -1,4 +1,4 @@
-"""Recall mode without the model (ARCHITECTURE.md §5.9): the live page store (recall.py), partial transcripts
+"""Recall mode without the model: the live page store (recall.py), partial transcripts
 (asr.Partials), voice activity (audio_io.Mic), cutting a KV cache back (recall_backend.cut), and the GPU worker's
 event flow on the simulated backend (recall_worker.py + scheduler.SimBackend)."""
 import threading
@@ -199,7 +199,7 @@ def test_worker_turn_on_the_simulated_backend():
     assert w.sched.ex_done == 1
 
 
-# ---------------------------------------------------------------- §12.13: OCR rows and timeline retrieval
+# ---------------------------------------------------------------- OCR rows and timeline retrieval
 
 def test_ocr_rows_join_cells_on_one_visual_row():
     from recall import ocr_rows

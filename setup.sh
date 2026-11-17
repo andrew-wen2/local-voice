@@ -37,7 +37,7 @@ if [[ -d models/parakeet-tdt-0.6b-v2/Encoder.mlmodelc ]]; then
 else   # Core ML bundles via FluidAudio 0.18.2 (pinned in tools/parakeet/Package.swift)
   tools/parakeet/.build/release/parakeet-serve --models models/parakeet-tdt-0.6b-v2 --download
 fi
-if [[ ! -f models/gemma-4-e4b-it-4bit/indexed_scales.safetensors ]]; then   # lossless scale index (§3.8), ~3 s
+if [[ ! -f models/gemma-4-e4b-it-4bit/indexed_scales.safetensors ]]; then   # lossless scale index, ~3 s
   .venv/bin/python -m kernels.indexed_qmv build
 fi
 if [[ ! -f models/gemma-4-e4b-it-4bit/lean_tokenizer.npz || ! -f models/gemma-4-e4b-it-4bit/lean_chat.json ]]; then

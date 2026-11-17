@@ -34,7 +34,7 @@ def test_a_dead_helper_is_restarted_and_the_text_still_spoken():
     try:
         t.proc.kill()
         t.proc.wait()
-        chunks = list(t.synth("The observatory was 36 meters high."))   # crashed the helper before §3.7's fix
+        chunks = list(t.synth("The observatory was 36 meters high."))   # once crashed the helper
         assert len(chunks) == 1 and len(chunks[0]) > 0
         assert len(t.failures) == 1 and "retry_error" not in t.failures[0]
     finally:

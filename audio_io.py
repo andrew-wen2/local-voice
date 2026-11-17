@@ -25,7 +25,7 @@ def first_audible(samples) -> Optional[int]:
     idx = np.nonzero(np.abs(samples) > 10 ** (AUDIBLE_DB / 20))[0]
     return int(idx[0]) if len(idx) else None
 
-# Voice activity while the key is held (recall mode, ARCHITECTURE.md §5.9). Provisional, and only used for
+# Voice activity while the key is held (recall mode). Provisional, and only used for
 # scheduling: a block is voiced above VOICE_DBFS; the mic counts as silent after SILENCE_S without a voiced block.
 VOICE_DBFS = -45.0
 SILENCE_S = 0.3

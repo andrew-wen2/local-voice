@@ -1,4 +1,4 @@
-# Exact environment the measurements in ARCHITECTURE.md were taken with (pip freeze, Python 3.13.12,
+# Exact environment the measurements were taken with (pip freeze, Python 3.13.12,
 # macOS 26.6.2, Apple M5), minus packages only removed
 # options used (MLX Kokoro 2026-11-12, the Core ML image encoder 2026-11-16). Installed by setup.sh.
 aiohappyeyeballs==2.7.1

@@ -1,5 +1,5 @@
 // kokoro-serve: Kokoro-82M text-to-speech through FluidAudio's KokoroAne (Core ML, Neural Engine + CPU),
-// the candidate replacement for MLX Kokoro on the GPU (ARCHITECTURE.md §3.7). English, voice af_heart
+// the candidate replacement for MLX Kokoro on the GPU. English, voice af_heart
 // (the app's voice). English text-to-phonemes runs in Swift (misaki lexicon + a small G2P model), so the
 // Python spaCy/misaki stack isn't needed.
 //
@@ -49,7 +49,7 @@ guard let modelsPath = arg("--models") else {
 }
 let modelsDir = URL(fileURLWithPath: modelsPath, isDirectory: true)
 var units = KokoroAneComputeUnits.default
-// Defaults chosen by measurement (ARCHITECTURE.md §3.7): the all-fp32 noise stage on the CPU (on the GPU it
+// Defaults chosen by measurement: the all-fp32 noise stage on the CPU (on the GPU it
 // cost ~1 GB more memory), and the alignment stage on the GPU: its CPU fallback (BNNS) traps on some exact
 // input lengths ("The observatory was 36 meters high." crashed 1 in 58 phrases; FluidAudio 0.18.2, both the
 // legacy and v3 chains). On the GPU: 0 crashes in 1,353 phrases, +10 MB.

@@ -1,4 +1,4 @@
-"""Custom Metal kernel #1: the vision encoder's q/k/v prologue, fused (kernel track, ARCHITECTURE.md §4.4).
+"""Custom Metal kernel #1: the vision encoder's q/k/v prologue, fused (kernel track).
 
 What it replaces. In each of the 16 vision layers, between the q/k/v projections and attention, mlx-vlm runs:
 

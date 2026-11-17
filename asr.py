@@ -2,7 +2,7 @@
 
 ParakeetServer: Parakeet TDT 0.6B v2 through FluidAudio (Core ML), `tools/parakeet`. Audio goes over the
 child's stdin and transcripts come back on stdout: no network, no audio on disk. ~40 ms for a 3 s question
-(Whisper large-v3 turbo, tried first, was ~470 ms because it always encodes a 30 s window; ARCHITECTURE.md §6.2).
+(Whisper large-v3 turbo, tried first, was ~470 ms because it always encodes a 30 s window).
 """
 
 from __future__ import annotations
@@ -140,9 +140,9 @@ class ParakeetServer:
 
 
 class Partials(threading.Thread):
-    """Partial transcripts while the talk key is held (recall mode, ARCHITECTURE.md §5.9). Parakeet has no streaming
+    """Partial transcripts while the talk key is held (recall mode). Parakeet has no streaming
     API here, so the audio so far is transcribed again, every `every_s` once `min_new_s` of new audio has arrived
-    (~40 ms for a 3 s question on the Neural Engine, which nothing else uses during a turn, §6.1).
+    (~40 ms for a 3 s question on the Neural Engine, which nothing else uses during a turn).
 
     get_audio() -> samples so far; voiced_until() -> sample index where the last voiced block ended;
     on_partial(text) for each changed transcript. `final_text()` after the key is released: the last partial

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """app.py — offline, screen-aware voice assistant (MVP, naive baseline).
 
-  python app.py                      live, with memory of past screens (recall mode, ARCHITECTURE.md §5.9): hold Right
+  python app.py                      live, with memory of past screens (recall mode): hold Right
                                      Option in any app to talk (release = stop, press while it speaks = interrupt);
                                      Enter in the terminal also works (talk / stop / interrupt), q = quit
   python app.py --screen-only        the previous app: the current screen only, no memory of past screens
@@ -373,10 +373,10 @@ def live(args):
     cap.cleanup()
 
 
-# ---------------------------------------------------------------- live mode with recall (ARCHITECTURE.md §5.9)
+# ---------------------------------------------------------------- live mode with recall
 
 def live_recall(args):
-    """Live mode with memory of past screens (recall_app.RecallApp; ARCHITECTURE.md §5.9, §5.12)."""
+    """Live mode with memory of past screens (recall_app.RecallApp)."""
     from recall_app import RecallApp
     if not scr.has_screen_permission():
         print("Screen Recording permission is off for this terminal app (System Settings > Privacy & Security > "
@@ -464,7 +464,7 @@ def add_worker_args(ap):
     ap.add_argument("--hotkey", choices=["right_option", "right_command", "right_control", "fn", "none"],
                     default="right_option", help="hold this key in any app to talk (needs Input Monitoring permission)")
     ap.add_argument("--swap-weights", choices=["on", "off"], default="on",
-                    help="keep only one of the image encoder / output layer in memory at a time (-0.33 GB, §3.9)")
+                    help="keep only one of the image encoder / output layer in memory at a time (-0.33 GB)")
     ap.add_argument("--history", choices=["on", "off", "auto"], default="auto",
                     help="conversation history in the context: auto = on live, off in replays (independent test questions)")
 
@@ -493,7 +493,7 @@ def main():
     if args.screen_only:
         live(args)
     else:
-        live_recall(args)                # the shipped app: recall mode (ARCHITECTURE.md §5.9)
+        live_recall(args)                # the shipped app: recall mode
 
 
 if __name__ == "__main__":

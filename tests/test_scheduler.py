@@ -1,4 +1,4 @@
-"""Turn scheduler (scheduler.py, ARCHITECTURE.md §5.9) on a fake clock. Piece times: S0 for screen reads (§5.8);
+"""Turn scheduler (scheduler.py) on a fake clock. Piece times: S0 for screen reads;
 page and question work in layer pieces (estimates, not measured)."""
 import pytest
 

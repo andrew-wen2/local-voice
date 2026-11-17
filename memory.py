@@ -1,4 +1,4 @@
-"""Screen memory for recall at question time (ARCHITECTURE.md §9.9).
+"""Screen memory for recall at question time.
 
 The hour is kept outside the model and searched per question; only a slice goes into the context.
 
@@ -8,7 +8,7 @@ The hour is kept outside the model and searched per question; only a slice goes 
   retrieve rank pages (or blocks) for a question and fill a token budget.
   check    "does the thing the question names appear anywhere in memory?" If a content word of the
            question was never on screen, answer "I didn't see that" instead of guessing. Tuned on the
-           synthetic dev sessions and weak on real near-miss questions (ARCHITECTURE.md §12.9): kept as an
+           synthetic dev sessions and weak on real near-miss questions: kept as an
            arm to compare against, off by default; refusing is the model's job.
 
 No model here: word matching only (BM25, Snowball English stemmer). Embeddings are a later arm.
@@ -21,7 +21,7 @@ from functools import lru_cache
 
 import snowballstemmer
 
-SECTION_TOKENS = 400     # best section per page: about two screens of OCR text (160-180 tokens a screen, §12.9)
+SECTION_TOKENS = 400     # best section per page: about two screens of OCR text (160-180 tokens a screen)
 
 # General English function words. Kept generic on purpose: the check must not be tuned to the benchmark's
 # phrasing (see eval/recall/retrieval.py for the dev / held-out split).
@@ -44,7 +44,7 @@ _STEMMER = snowballstemmer.stemmer("english")
 @lru_cache(maxsize=200_000)
 def stem(w: str) -> str:
     """Snowball English (Porter2), applied the same way to memory and questions. Replaced a hand-written
-    suffix stripper written after reading the benchmark's questions (§12.9)."""
+    suffix stripper written after reading the benchmark's questions."""
     return _STEMMER.stemWord(re.sub(r"'s$", "", w))
 
 

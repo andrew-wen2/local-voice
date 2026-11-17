@@ -1,4 +1,4 @@
-"""recall_app.py — recall mode's wiring as one object (ARCHITECTURE.md §5.9, §5.12, §5.27).
+"""recall_app.py — recall mode's wiring as one object.
 
 The frames the app reads are OCR'd into pages and visits (recall.py), kept screens are encoded (Neural Engine when it
 can) and keyed, and the turn scheduler (scheduler.py, recall_worker.py) runs the GPU. While the key is held, partial
@@ -84,7 +84,7 @@ class RecallApp:
         self.asr.transcribe(WARM_WAV.read_bytes())
         self.tts = make_tts(log_dir=LOGS)
         self.store = Store(start=datetime.fromtimestamp(self.clock()))
-        self.screens = ScreenStore()                     # kept screens: owner-only folder, deleted on quit (§5.12)
+        self.screens = ScreenStore()                     # kept screens: owner-only folder, deleted on quit
         adapter = GemmaAdapter(swap_weights=self.swap_weights, instruction=RECALL_INSTRUCTION)
         self.worker = RecallWorker(adapter, self.tts, self.store, budget=self.budget, freshness=self.freshness,
                                    trim_silence=self.trim_silence,
@@ -156,7 +156,7 @@ class RecallApp:
     # ------------------------------------------------------------ screen
 
     def _grab(self):
-        self.before["windows"] = self.windows_fn()       # the window list just before the screenshot (§12.9)
+        self.before["windows"] = self.windows_fn()       # the window list just before the screenshot
         return self.grab_screen()
 
     def _on_frame(self, frame_id, t, img, note=None):
@@ -188,7 +188,7 @@ class RecallApp:
         threading.Thread(target=self._watch_voice, args=(self.turn["stop"],), daemon=True).start()
 
     def _watch_voice(self, stop):
-        """mic_silent / speech events while the key is held (scheduling only, §5.9)."""
+        """mic_silent / speech events while the key is held (scheduling only)."""
         silent = False
         while not stop.wait(0.05):
             s = self.mic.silent_for()

@@ -1,4 +1,4 @@
-"""recall_backend.py — the scheduler's GPU work on real KV caches (ARCHITECTURE.md §5.9, §3.11). MLX, so every
+"""recall_backend.py — the scheduler's GPU work on real KV caches. MLX, so every
 method runs on the GPU worker thread.
 
 Context layout (token ids):
@@ -9,11 +9,10 @@ Context layout (token ids):
   screen   <turn|>\\n + the screen turn (image + instructions + "Question:")        stored piece, its own read
   question the question and the model turn's opening                              prefilled before key up if
                                                                                     possible, else at release
-The pages and screen parts are §3.11's layout. The timeline is closed in its own turn (§3.11 had timeline and pages
-in one turn) so that a finished exchange can be appended after it without recomputing the timeline: that change
-is not measured yet.
+The timeline is closed in its own turn (it used to share one with the pages) so that a finished exchange can be
+appended after it without recomputing the timeline: that change is not measured yet.
 
-Stored page pieces (graph, §3.11): a page is computed after the stored pieces of its K_PARENTS most similar pages
+Stored page pieces (graph): a page is computed after the stored pieces of its K_PARENTS most similar pages
 first seen before it (the retriever's BM25, the page's title and text as the query), loaded and re-rotated, after
 the anchor <bos> <|turn>user\\n pages header. The piece (full-attention entries, 16 KB a token, and its last W window
 entries, needed only when it is a parent in a later build) goes to a private folder on disk, deleted when the app
@@ -21,11 +20,11 @@ quits; memory holds only its token ids and parents, so memory doesn't grow with 
 question loads the pieces its context uses, bounded by the context cap. A page's piece is rebuilt when its version changes (a visit of it ended: its text and time
 header changed).
 
-Kept screens (visual memory, §5.12): retrieved past screens come first after the prefix, each as its own user turn
+Kept screens (visual memory): retrieved past screens come first after the prefix, each as its own user turn
 "(Earlier screen) [time] title" + its image tokens, computed exactly from its stored vision features (screen_store.py)
 while you speak, never as a stored KV piece; then the pages turn opens (a fixed opener, computed exactly), then pages,
 then the current screen. Screens are found by text (frame BM25) and Gemma's own keys (layers 11 + 17, calibrated by
-the content-free query, §12.17/12.19), combined by better rank. A kept screen's keys are computed in quiet time.
+the content-free query), combined by better rank. A kept screen's keys are computed in quiet time.
 Slot kinds: a page (key, version, lines); a screen (SCREEN, frame id); the opener (OPENER,); keying work (KEY, frame id).
 
 Pieces follow the scheduler's protocol: a generator announces the kind of its next piece, then runs it. Prefill
@@ -56,27 +55,26 @@ from screen_store import KEY_LAYERS, Screen, quantize_int8
 
 IMAGE = "<|image|>"
 # The answer's first chunk: the first sentence split early at punctuation after >= 3 words, else the whole sentence
-# (ARCHITECTURE.md §5.33; a split before a break word such as "is" was faster but left an audible seam).
+# (a split before a break word such as "is" was faster but left an audible seam).
 FIRST_MIN_WORDS = 3
 READ_FEATS = 4                   # image features of the last reads kept for keying (~5.5 MB each)
 MAX_BRANCHES = 2                 # exact caches kept: the current context and the runner-up (~0.1 GB each, estimate)
 
 SCREEN, OPENER, KEY = "§screen", "§opener", "§key"
-# A kept screen's block (M3 / stretch step 1, 2026-11-15, ARCHITECTURE.md §5.29): (BLOCK, fid, view slot) = its screen
-# turn, the opener and its memory view, one slot. Computed exactly at question time like any slot, or loaded: stored
-# once in quiet time after the prefix of then and spliced with keys re-rotated (offline on h1-h4: recall 66 vs 67
-# exact, made up 8 vs 7, reading 19 vs 19; within the bar in CLAUDE.md).
+# A kept screen's block (2026-11-15): (BLOCK, fid, view slot) = its screen turn, the opener and its memory view,
+# one slot. Computed exactly at question time like any slot, or loaded: stored once in quiet time after the prefix
+# of then and spliced with keys re-rotated (measured as accurate as computing it exactly).
 BLOCK = "§block"
 KEPT_HEAD = "(Earlier screen from {time}, no longer on screen) {title}"       # a kept screen's label
-NULL_Q = "N/A"                    # ICR's content-free query (§12.17)
+NULL_Q = "N/A"                    # ICR's content-free query
 
-K_PARENTS = 4                 # §3.11: similar4 met the bar
+K_PARENTS = 4                 # a page is computed after its 4 most similar pages
 CHUNK = 512                   # tokens per prefill chunk
-TOKENS_PER_S = 2200           # prefill rate, plugged in (§5.8); first estimate only, then measured per kind
+TOKENS_PER_S = 2200           # prefill rate, plugged in; first estimate only, then measured per kind
 PIECE_OVERHEAD_S = 0.003      # S0: pausing costs ~3 ms a piece
 HEAD = (PAGES_HEAD + HINT).rstrip("\n")
 VISION_KINDS = ["prep", "patch"] + ["vision"] * 16 + ["pool"]
-PRIORS = {                    # seconds; S0 (§5.8) for the read, estimates for the rest
+PRIORS = {                    # seconds; S0 for the read, estimates for the rest
     "prep": 0.061, "patch": 0.088, "vision": 0.080, "pool": 0.010, "embed": 0.008, "text": 0.042,
     "check": 0.0005, "plan_build": 0.010, "assemble": 0.015, "answer_prefill": 0.060, "decode": 0.026,
     "text1": 0.021, "screen_prep": 0.004, "append": 0.030,     # features from disk + the cached token layout (2-3 ms measured, 2026-11-13)
@@ -167,7 +165,7 @@ class TurnIO:
 class RecallBackend:
     def __init__(self, adapter, store, tts=None, trim_silence: bool = True,
                  history_max_tokens: int = 2000, k_parents: int = K_PARENTS, piece_dir: Optional[Path] = None,
-                 screen_store=None, n_screens: int = 1):           # Andrew, 2026-11-11 (§5.13)
+                 screen_store=None, n_screens: int = 1):           # Andrew, 2026-11-11
         self.a, self.store, self.tts = adapter, store, tts
         self.ss, self.n_screens = screen_store, n_screens
         from concurrent.futures import ThreadPoolExecutor
@@ -325,7 +323,7 @@ class RecallBackend:
         return kind(slot) == BLOCK
 
     def exact_wanted(self, slot) -> bool:
-        """A stored block is used as it is: computing it exactly as well gained nothing measurable (§5.29) and would
+        """A stored block is used as it is: computing it exactly as well gained nothing measurable and would
         restart a question prefill already under way over the stored one."""
         return not (kind(slot) == BLOCK and slot in self.blocks)
 
@@ -390,7 +388,7 @@ class RecallBackend:
         def g():
             yield "plan_build"                          # CPU: version, parents (BM25 over the store)
             with self.store.lock:
-                p = self.store.page(key)                # a page, or a kept screen's view (§5.25)
+                p = self.store.page(key)                # a page, or a kept screen's view
                 if p is None:
                     return
                 v = self.store.version[key]
@@ -430,7 +428,7 @@ class RecallBackend:
                 del c
         return g()
 
-    # ------------------------------------------------------------ kept screens (§5.12)
+    # ------------------------------------------------------------ kept screens
 
     def _inputs_like(self, size, text: str) -> dict:
         """Processor inputs for `text` (with one "<|image|>") as if the image were `size`; the pixels are left out
@@ -489,7 +487,7 @@ class RecallBackend:
 
     def _queries_steps(self, text: str, T: int):
         """The question's queries at KEY_LAYERS (post-RoPE, as attention sees them), re-rotated to sit right after a
-        screen turn of T tokens, as in §12.17's measurement. {layer: (queries [heads, Lq, D] float16, scale)}.
+        screen turn of T tokens, as when the keys were measured. {layer: (queries [heads, Lq, D] float16, scale)}.
         Generator in pieces of QUERY_LAYERS text layers ("rq"). Only the layers up to the last key layer run: the
         queries there don't depend on later layers (M3, 2026-11-15: 18 of 24 layers, same values). The capture is
         on only during this pass's own pieces, so pieces of other jobs in between aren't captured."""
@@ -572,7 +570,7 @@ class RecallBackend:
             self.ss.add(Screen(fid, meta["t"], meta["key"], meta["title"], meta["lines"], keys, null, path,
                                size=tuple(meta["size"]), T=T))
             self.ss.expire(meta["t"])
-            self.store.set_view(fid, self.ss.screens[fid])          # §5.25: its view text, a memory slot
+            self.store.set_view(fid, self.ss.screens[fid])          # its view text, a memory slot
             for vk in [k for k in self.store.views if int(k[5:]) not in self.ss.screens]:
                 self.store.drop_view(int(vk[5:]))
                 self._forget(vk)
@@ -591,7 +589,7 @@ class RecallBackend:
         return f is None or f.done()
 
     def find_screens_steps(self, text: str):
-        """The kept screens to put in the context for this (partial) question: §12.17's combination of text (frame BM25)
+        """The kept screens to put in the context for this (partial) question: a combination of text (frame BM25)
         and Gemma's keys (calibrated, z-normalised, summed over KEY_LAYERS), better rank first; top n_screens.
         Generator (announce protocol): the question pass ("rq" pieces), then one "rs" piece per key layer and chunk."""
         if self.ss is None or self.n_screens <= 0:
@@ -637,7 +635,7 @@ class RecallBackend:
         for L in KEY_LAYERS:
             cal = np.concatenate(raw[L]) - np.array([s.null[L] for s in screens])
             total += (cal - cal.mean()) / (cal.std() + 1e-9)
-        # §5.21 / §5.23 (adopted 2026-11-12): keys and the unit's text, each z-normalised, summed with equal weight.
+        # Adopted 2026-11-12: keys and the unit's text, each z-normalised, summed with equal weight.
         # The earlier better-rank fuse let the keys alone pick at 1 screen (text never won a disagreement).
         bt = self.ss.text_scores(text, fids)
         zt = (bt - bt.mean()) / (bt.std() + 1e-9)
@@ -772,7 +770,7 @@ class RecallBackend:
         # current screen piece (which has window entries) refills the window at the end.
         rest = list(slots[frontier:])
         last = max((i for i, sl in enumerate(rest) if not self.has_piece(sl)), default=-1)
-        if exact_all:                                   # every slot computed (§5.14's comparison)
+        if exact_all:                                   # every slot computed (for comparison)
             last = len(rest) - 1
         assert compute_missing or last < 0, rest[last]
         for slot in rest[:last + 1]:

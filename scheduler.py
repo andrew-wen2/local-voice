@@ -1,4 +1,4 @@
-"""Turn scheduler: which piece of GPU work runs next (ARCHITECTURE.md §5.9). No MLX here: the GPU work comes
+"""Turn scheduler: which piece of GPU work runs next. No MLX here: the GPU work comes
 from a backend, as generators of pieces, so the same logic runs on the GPU or on a fake clock in tests.
 
 The context for a question is four regions, oldest first:
@@ -6,7 +6,7 @@ The context for a question is four regions, oldest first:
              an exact cache. Its version goes up when it is rebuilt (a visit ended: quiet time only, so the
              timeline is fixed for a turn) or when a finished exchange is appended (the next answer waits for that)
   pages      retrieved pages in context order: the first `frontier` computed exactly (together, in order, after
-             the timeline), the rest from stored graph pieces (§3.11)
+             the timeline), the rest from stored graph pieces
   screen     the newest finished screen read (a stored piece)
   question   prefilled ahead of key up when its inputs are stable
 A key names one context: (prefix version, pages, frontier, screen frame). Work done against a key that has
@@ -69,7 +69,7 @@ ALLOWED = {
     State.ANSWERING: {Cls.CRITICAL, Cls.BLOCKING},
 }
 
-# Longest IMPROVING / BACKGROUND piece allowed to start, seconds. Provisional (§5.9): to be set from the measured
+# Longest IMPROVING / BACKGROUND piece allowed to start, seconds. Provisional: to be set from the measured
 # gap between the last word and key up, before any latency run.
 PIECE_LIMIT_S = {State.QUIET: math.inf, State.LISTENING: 0.050, State.TAIL: 0.025,
                  State.RELEASED: 0.0, State.ANSWERING: 0.0}
@@ -380,7 +380,7 @@ class Scheduler:
                  clock: Callable[[], float] = time.perf_counter, freshness: str = "B",
                  limits: Optional[dict] = None, retrieve_alt: Optional[Callable[[str], Optional[tuple]]] = None,
                  retrieve_steps: Optional[Callable] = None):
-        assert freshness in ("B", "C"), freshness       # A answered from the old screen and got it wrong (§5.4)
+        assert freshness in ("B", "C"), freshness       # A answered from the old screen and got it wrong
         self.backend, self.retrieve, self.clock, self.freshness = backend, retrieve, clock, freshness
         self.retrieve_alt = retrieve_alt if hasattr(backend, "exact_len") else None   # branches needed
         self.retrieve_steps = retrieve_steps   # text -> generator of pieces returning (pages, alt): see Retrieve
@@ -712,7 +712,7 @@ class Scheduler:
             job.next_kind = next(job.gen)
         except StopIteration as e:
             done, result = True, e.value
-        except Exception as e:                          # one failed job must not stop the loop (§3.7's rule)
+        except Exception as e:                          # one failed job must not stop the loop
             import traceback
             self.stats["errors"] = self.stats.get("errors", 0) + 1
             self.errors = (self.errors + [(type(job).__name__, kind, traceback.format_exc())])[-20:]
@@ -782,7 +782,7 @@ class FakeClock:
 class SimBackend:
     """GPU work replaced by fixed piece times on a fake clock. Piece kinds and the counts per job follow the real
     work: a screen read is prep, patch embedding, 16 vision layers, pooling, embeddings and 12 two-layer text
-    pieces (S0, §5.8); page work and question prefill run in layer pieces."""
+    pieces (S0); page work and question prefill run in layer pieces."""
 
     def __init__(self, clock: FakeClock, times: dict[str, float], built=(), page_pieces: int = 24,
                  question_pieces: int = 6, answer_tokens: int = 10, history: bool = True):

@@ -1,4 +1,4 @@
-"""Faster Gemma 4 vision encoder (kernel track, ARCHITECTURE.md §4.4). Same outputs, less waste.
+"""Faster Gemma 4 vision encoder (kernel track). Same outputs, less waste.
 
 1. Patch position embedding as a gather. mlx-vlm builds a one-hot [patches, 2, 10240] float32 tensor
    (~786 MB at 1120) and multiplies it by the position table; a lookup gives bit-identical values
@@ -67,7 +67,7 @@ def layer_fn(layer, compiled: bool, kernel: bool = False):
     key = (id(layer), kernel)
     if key not in _compiled:
         # inputs=layer.state: the layer's weights are inputs read at every call, not constants frozen at the
-        # first trace, so weights swapped in and out (ARCHITECTURE.md §3.9) are used and freed correctly.
+        # first trace, so weights swapped in and out are used and freed correctly.
         if kernel:
             _compiled[key] = mx.compile(lambda h, pos, c, s: block_forward(layer, h, pos, None, (c, s)),
                                         inputs=layer.state)
